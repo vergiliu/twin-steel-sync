@@ -1,0 +1,25 @@
+[package]
+name = "twin"
+version = "0.1.0"
+edition = "2021"
+description = "Two-way directory synchronizer: local paths, or a host over mutual TLS"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+blake3 = "1"
+clap = { version = "4", features = ["derive", "env"] }
+filetime = "0.2"
+ignore = "0.4"
+libc = "0.2"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pemfile = "2"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
