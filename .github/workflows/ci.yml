@@ -1,0 +1,112 @@
+# Continuous integration for twin.
+#
+# What this workflow guarantees: every push and every pull request is checked
+# with the three commands the project claims to pass — `cargo fmt --check`,
+# `cargo clippy --all-targets -- -D warnings` and `cargo test` — and it is
+# checked on both platforms the product claims to support.
+#
+# Why two platforms: F-060 promises macOS <-> Linux pairs, and the program is
+# not the same program on both (F_FULLFSYNC on macOS, a directory fsync on
+# Linux, different rules for names a filesystem cannot represent). A suite that
+# only ever runs on one machine cannot honestly claim that. The macOS job also
+# runs scripts/codesign-macos.sh, whose macOS branch would otherwise never be
+# exercised by anything automatic.
+#
+# Note: `make check` is deliberately not used here. It runs `cargo fmt` in write
+# mode, so it would quietly reformat the sources instead of failing on a
+# badly formatted one. The three cargo commands are spelled out instead.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failing test on a runner is much easier to read with a backtrace.
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: lint (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache the cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check the formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint with warnings denied
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache the cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the binary
+        run: cargo build
+
+      # The local build signs what it produces, because macOS refuses
+      # local-network connections from programs it does not trust. The script is
+      # a no-op on every platform but macOS.
+      - name: Sign the binary (macOS only)
+        if: runner.os == 'macOS'
+        run: sh scripts/codesign-macos.sh target/debug/twin
+
+      - name: Run the test suite
+        run: cargo test --all-targets
+
+  scale:
+    # The 10k-file tree of F-071 is ignored by the default test run: F-021 puts
+    # every file through an fsync, and on macOS that fsync is an F_FULLFSYNC, so
+    # ten thousand files cost minutes. It is still checked on every push, here,
+    # where it can have a timeout of its own.
+    name: scale (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache the cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the 10k-file tree test
+        run: cargo test --test scale -- --ignored --nocapture

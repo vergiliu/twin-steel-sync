@@ -1,0 +1,1 @@
+- everytime a new feature is added add its description in README.md file and mark it as implemented
