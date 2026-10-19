@@ -1,5 +1,5 @@
 use crate::fsutil::mtime_ns;
-use crate::model::{Entry, Kind};
+use crate::model::{Entry, Kind, PathFailure};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -98,16 +98,33 @@ struct Frame {
 /// than one directory's worth of names in memory.
 pub struct Scanner {
     root: PathBuf,
+    /// The root as an absolute path, so the excluded directories can be
+    /// compared with it whatever the caller passed in.
+    root_abs: PathBuf,
     rules: IgnoreRules,
+    /// Directories that are never walked: the backup directory lives here, and
+    /// what it holds must not travel back into the pair.
+    excluded: Vec<PathBuf>,
     stack: Vec<Frame>,
 }
 
 impl Scanner {
     pub fn new(root: &Path, rules: IgnoreRules) -> io::Result<Self> {
+        Self::with_excluded(root, rules, Vec::new())
+    }
+
+    /// A scanner that never descends into the given absolute directories.
+    pub fn with_excluded(
+        root: &Path,
+        rules: IgnoreRules,
+        excluded: Vec<PathBuf>,
+    ) -> io::Result<Self> {
         let children = read_children(root)?;
         Ok(Scanner {
             root: root.to_path_buf(),
+            root_abs: absolute(root),
             rules,
+            excluded,
             stack: vec![Frame {
                 dir_rel: PathBuf::new(),
                 children,
@@ -116,7 +133,9 @@ impl Scanner {
         })
     }
 
-    pub fn next_entry(&mut self) -> Option<io::Result<Entry>> {
+    /// The next entry, or the failure of the one path that could not be read.
+    /// A path that cannot be read is not a reason to abandon the whole walk.
+    pub fn next_entry(&mut self) -> Option<Result<Entry, PathFailure>> {
         loop {
             let top = self.stack.len().checked_sub(1)?;
             if self.stack[top].idx >= self.stack[top].children.len() {
@@ -130,9 +149,17 @@ impl Scanner {
                 continue;
             }
             let abs = self.root.join(&rel);
+            if self.is_excluded(&rel) {
+                continue;
+            }
             let meta = match fs::symlink_metadata(&abs) {
                 Ok(m) => m,
-                Err(e) => return Some(Err(e)),
+                Err(e) => {
+                    return Some(Err(PathFailure {
+                        path: rel,
+                        message: format!("reading {}: {e}", abs.display()),
+                    }))
+                }
             };
             let kind = kind_of(&meta);
 
@@ -143,11 +170,36 @@ impl Scanner {
                         children,
                         idx: 0,
                     }),
-                    Err(e) => return Some(Err(e)),
+                    Err(e) => {
+                        return Some(Err(PathFailure {
+                            path: rel,
+                            message: format!("listing {}: {e}", abs.display()),
+                        }))
+                    }
                 }
             }
 
             return Some(Ok(entry_for(rel, &meta)));
+        }
+    }
+
+    fn is_excluded(&self, rel: &Path) -> bool {
+        if self.excluded.is_empty() {
+            return false;
+        }
+        let abs = self.root_abs.join(rel);
+        self.excluded.iter().any(|dir| abs.starts_with(dir))
+    }
+}
+
+/// An absolute, normalized version of a path, so two paths can be compared.
+pub fn absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => path.to_path_buf(),
         }
     }
 }

@@ -1,5 +1,7 @@
-use crate::fsutil::{copy_atomic, hash_file, prune_empty_dirs};
-use crate::model::{Entry, Hash};
+use crate::fsutil::{
+    copy_atomic, copy_resumable, hash_file, prune_empty_dirs, temp_file_name, ErrCtx,
+};
+use crate::model::{Entry, Hash, PathFailure};
 use crate::scan::{entry_for, IgnoreRules, Scanner};
 use std::fs;
 use std::io;
@@ -10,14 +12,20 @@ use std::path::{Path, PathBuf};
 pub trait Backend {
     /// Human-facing identity, used in messages.
     fn label(&self) -> &str;
-    /// Next entry in component order; `None` at the end of the tree.
-    fn walk(&mut self) -> io::Result<Option<Entry>>;
+    /// Next entry in component order; `None` at the end of the tree. A path
+    /// that cannot be read is reported on its own, not as a failure of the
+    /// whole walk.
+    fn walk(&mut self) -> io::Result<Option<Result<Entry, PathFailure>>>;
     fn hash(&mut self, path: &Path) -> io::Result<Hash>;
     fn stat(&mut self, path: &Path) -> io::Result<Option<Entry>>;
     /// Send the local file at `local_src` to this side at `path`, atomically.
-    fn put(&mut self, path: &Path, local_src: &Path) -> io::Result<Hash>;
+    /// With `resume`, a partial transfer left at the destination is continued
+    /// instead of started over.
+    fn put(&mut self, path: &Path, local_src: &Path, resume: bool) -> io::Result<Hash>;
     /// Bring this side's `path` to the local path `local_dst`, atomically.
-    fn get(&mut self, path: &Path, local_dst: &Path) -> io::Result<Hash>;
+    /// With `resume`, a partial transfer left at the destination is continued
+    /// instead of started over.
+    fn get(&mut self, path: &Path, local_dst: &Path, resume: bool) -> io::Result<Hash>;
     fn remove(&mut self, path: &Path) -> io::Result<()>;
     /// Release any resources; called once per run.
     fn finish(&mut self) -> io::Result<()> {
@@ -33,10 +41,15 @@ pub struct LocalBackend {
 
 impl LocalBackend {
     pub fn new(root: &Path, rules: IgnoreRules) -> io::Result<Self> {
+        Self::excluding(root, rules, Vec::new())
+    }
+
+    /// A backend that never walks into the given absolute directories.
+    pub fn excluding(root: &Path, rules: IgnoreRules, excluded: Vec<PathBuf>) -> io::Result<Self> {
         Ok(LocalBackend {
             label: root.display().to_string(),
             root: root.to_path_buf(),
-            scanner: Some(Scanner::new(root, rules)?),
+            scanner: Some(Scanner::with_excluded(root, rules, excluded)?),
         })
     }
 
@@ -45,24 +58,30 @@ impl LocalBackend {
     }
 }
 
+/// The temporary file that holds a transfer in flight for `dst`. Its name is
+/// derived from the destination, so the next run finds what this one left.
+pub fn temp_for(dst: &Path) -> PathBuf {
+    match dst.parent() {
+        Some(parent) => parent.join(temp_file_name(dst)),
+        None => PathBuf::from(temp_file_name(dst)),
+    }
+}
+
 impl Backend for LocalBackend {
     fn label(&self) -> &str {
         &self.label
     }
 
-    fn walk(&mut self) -> io::Result<Option<Entry>> {
+    fn walk(&mut self) -> io::Result<Option<Result<Entry, PathFailure>>> {
         match self.scanner.as_mut() {
             None => Ok(None),
-            Some(scanner) => match scanner.next_entry() {
-                None => Ok(None),
-                Some(Ok(entry)) => Ok(Some(entry)),
-                Some(Err(e)) => Err(e),
-            },
+            Some(scanner) => Ok(scanner.next_entry()),
         }
     }
 
     fn hash(&mut self, path: &Path) -> io::Result<Hash> {
-        hash_file(&self.root.join(path))
+        let abs = self.root.join(path);
+        hash_file(&abs).ctx(|| format!("hashing {}", abs.display()))
     }
 
     fn stat(&mut self, path: &Path) -> io::Result<Option<Entry>> {
@@ -73,12 +92,24 @@ impl Backend for LocalBackend {
         }
     }
 
-    fn put(&mut self, path: &Path, local_src: &Path) -> io::Result<Hash> {
-        copy_atomic(local_src, &self.root.join(path))
+    fn put(&mut self, path: &Path, local_src: &Path, resume: bool) -> io::Result<Hash> {
+        let dst = self.root.join(path);
+        let tmp = temp_for(&dst);
+        if resume {
+            copy_resumable(local_src, &dst, &tmp)
+        } else {
+            copy_atomic(local_src, &dst, &tmp)
+        }
     }
 
-    fn get(&mut self, path: &Path, local_dst: &Path) -> io::Result<Hash> {
-        copy_atomic(&self.root.join(path), local_dst)
+    fn get(&mut self, path: &Path, local_dst: &Path, resume: bool) -> io::Result<Hash> {
+        let src = self.root.join(path);
+        let tmp = temp_for(local_dst);
+        if resume {
+            copy_resumable(&src, local_dst, &tmp)
+        } else {
+            copy_atomic(&src, local_dst, &tmp)
+        }
     }
 
     fn remove(&mut self, path: &Path) -> io::Result<()> {

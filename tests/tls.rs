@@ -404,6 +404,66 @@ fn pull_never_pushes_however_the_arguments_are_ordered() {
     );
 }
 
+/// `twin authorize` must take effect on a running server: a client that is
+/// authorized while the server runs gets in on its next attempt, and a client
+/// that is withdrawn is refused from then on. Neither needs a restart.
+#[test]
+fn authorizing_a_client_takes_effect_without_restarting_the_server() {
+    let (fixture, server) = Fixture::new();
+
+    // A second machine, with its own identity and its own directory.
+    let stranger_data = fixture._root.path().join("stranger-data");
+    let stranger = stranger_data.join("local");
+    fs::create_dir_all(&stranger).unwrap();
+    let stranger_fp = fingerprint_of(&stranger_data);
+    fs::write(stranger.join("hello.txt"), "from the stranger").unwrap();
+    let server_data = fixture._root.path().join("server-data");
+
+    // Not authorized yet: refused.
+    let (code, output) = run(client(&stranger_data)
+        .args(["push", stranger.to_str().unwrap(), server.spec()])
+        .arg("--pin")
+        .arg(&server.fingerprint)
+        .arg("--auto"));
+    assert_ne!(code, 0, "an unauthorized client must be refused: {output}");
+
+    // Authorized while the server runs: let in, without a restart.
+    let (code, output) = run(client(&server_data).arg("authorize").arg(&stranger_fp));
+    assert_eq!(code, 0, "{output}");
+    let (code, output) = run(client(&stranger_data)
+        .args(["push", stranger.to_str().unwrap(), server.spec()])
+        .arg("--pin")
+        .arg(&server.fingerprint)
+        .arg("--auto"));
+    assert_eq!(code, 0, "the client must be let in now: {output}");
+    assert!(
+        fixture.remote.join("hello.txt").exists(),
+        "the file must have travelled: {output}"
+    );
+
+    // Withdrawn: refused again, still without a restart.
+    let list = server_data.join("authorized_clients");
+    let kept: Vec<String> = fs::read_to_string(&list)
+        .unwrap()
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty() && line != &stranger_fp)
+        .collect();
+    fs::write(&list, format!("{}\n", kept.join("\n"))).unwrap();
+    fs::remove_file(fixture.remote.join("hello.txt")).unwrap();
+
+    let (code, output) = run(client(&stranger_data)
+        .args(["push", stranger.to_str().unwrap(), server.spec()])
+        .arg("--pin")
+        .arg(&server.fingerprint)
+        .arg("--auto"));
+    assert_ne!(code, 0, "a withdrawn client must be refused: {output}");
+    assert!(
+        !fixture.remote.join("hello.txt").exists(),
+        "nothing may be written by a withdrawn client: {output}"
+    );
+}
+
 /// A bare "skipped 1" reads like a failure. The reason must be visible without -v.
 #[test]
 fn skipping_says_what_was_skipped_and_why() {

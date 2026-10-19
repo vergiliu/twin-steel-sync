@@ -10,7 +10,7 @@ CARGO ?= cargo
 SIGN  := scripts/codesign-macos.sh
 
 .DEFAULT_GOAL := help
-.PHONY: help build release test lint fmt check sign verify clean
+.PHONY: help build release test lint fmt check scale sign verify clean
 
 help: ## Show the available targets
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-9s %s\n", $$1, $$2}'
@@ -33,6 +33,9 @@ fmt: ## Format the sources
 	$(CARGO) fmt
 
 check: fmt lint test sign ## Format, lint, test, then sign whatever was produced
+
+scale: ## The 10k-file tree test (slow: one fsync per file)
+	$(CARGO) test --test scale -- --ignored --nocapture
 
 sign: ## Sign whatever binaries already exist (macOS)
 	@for binary in target/debug/twin target/release/twin; do \

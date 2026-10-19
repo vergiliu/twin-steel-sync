@@ -13,11 +13,12 @@ use rustls::{
 };
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
@@ -209,9 +210,40 @@ impl ServerCertVerifier for PinnedPeer {
 }
 
 /// The other direction: only clients whose fingerprint was authorized may connect.
+///
+/// The list is shared and guarded by a lock: `twin authorize` writes the file,
+/// the accept loop reads it back before every connection, and the verifier
+/// reads the same set. A client that is authorized while the server runs is
+/// let in on its next attempt, and a client that is removed is refused from
+/// then on — no restart involved.
+pub type AllowList = Arc<RwLock<HashSet<String>>>;
+
+/// A shared allow list, ready to be handed to the verifier.
+pub fn allow_list(fingerprints: Vec<String>) -> AllowList {
+    Arc::new(RwLock::new(fingerprints.into_iter().collect()))
+}
+
+/// Read the allow list back from disk and publish it to the verifier.
+pub fn refresh_allow_list(list: &AllowList, path: &Path) -> io::Result<()> {
+    let fresh = read_list(path)?;
+    let mut guard = list
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = fresh.into_iter().collect();
+    Ok(())
+}
+
+/// The fingerprints the server currently accepts.
+pub fn allowed_fingerprints(list: &AllowList) -> Vec<String> {
+    let guard = list.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut names: Vec<String> = guard.iter().cloned().collect();
+    names.sort();
+    names
+}
+
 #[derive(Debug)]
 struct AuthorizedClients {
-    allowed: Vec<String>,
+    allowed: AllowList,
 }
 
 impl ClientCertVerifier for AuthorizedClients {
@@ -226,11 +258,16 @@ impl ClientCertVerifier for AuthorizedClients {
         _now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
         let presented = fingerprint_of(end_entity);
-        if self.allowed.contains(&presented) {
+        let allowed = self
+            .allowed
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if allowed.contains(&presented) {
             Ok(ClientCertVerified::assertion())
         } else {
             Err(rustls::Error::General(format!(
-                "client {presented} is not authorized on this server"
+                "client {presented} is not authorized on this server (run `twin authorize {presented}` \
+                 there; it takes effect on the next connection)"
             )))
         }
     }
@@ -270,12 +307,12 @@ impl ClientCertVerifier for AuthorizedClients {
     }
 }
 
-pub fn server_config(identity: &Identity, allowed: &[String]) -> io::Result<Arc<ServerConfig>> {
+pub fn server_config(identity: &Identity, allowed: &AllowList) -> io::Result<Arc<ServerConfig>> {
     let config = ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| io::Error::other(format!("cannot set up TLS: {e}")))?
         .with_client_cert_verifier(Arc::new(AuthorizedClients {
-            allowed: allowed.to_vec(),
+            allowed: allowed.clone(),
         }))
         .with_single_cert(identity.certs()?, identity.key()?)
         .map_err(|e| io::Error::other(format!("cannot use the identity: {e}")))?;
@@ -412,7 +449,8 @@ pub fn connect(
     if let Err(error) = stream.conn.complete_io(&mut stream.sock) {
         return Err(io::Error::other(format!(
             "{host}:{port}: the TLS handshake failed: {error}. Is this client authorized there \
-             (`twin id` here, then `twin authorize <fingerprint>` on the server), and does the pin match?"
+             (`twin id` here, then `twin authorize <fingerprint>` on the server — it takes effect \
+             on the next connection), and does the pin match?"
         )));
     }
     crate::debug!("handshake with {host}:{port} done");
@@ -420,15 +458,20 @@ pub fn connect(
 }
 
 /// Serve one directory over TLS until interrupted. One connection at a time.
+///
+/// The allow list is read back from disk before every connection, so
+/// `twin authorize` takes effect on the next attempt instead of after a
+/// restart.
 pub fn serve_forever(
     root: &Path,
     identity: &Identity,
-    allowed: &[String],
+    allowed: &AllowList,
+    list_path: &Path,
     listen: &str,
     once: bool,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    if allowed.is_empty() {
+    if allowed_fingerprints(allowed).is_empty() {
         return Err(io::Error::other(
             "no clients are authorized yet, so every connection would be refused.\n\
              On this machine run `twin id` on the client, then `twin authorize <fingerprint>` here.",
@@ -473,7 +516,11 @@ pub fn serve_forever(
         root.display(),
         identity.fingerprint()
     )?;
-    writeln!(out, "authorized clients: {}", allowed.len())?;
+    writeln!(
+        out,
+        "authorized clients: {}",
+        allowed_fingerprints(allowed).len()
+    )?;
     out.flush()?;
 
     loop {
@@ -484,6 +531,12 @@ pub fn serve_forever(
                 continue;
             }
         };
+        // The allow list is read back from disk for every connection: a client
+        // authorized (or withdrawn) while the server runs is refused (or let
+        // in) on its next attempt.
+        if let Err(error) = refresh_allow_list(allowed, list_path) {
+            crate::warn!("cannot read the authorized clients: {error}");
+        }
         crate::debug!("accepted {peer}: {}", describe_socket(&tcp));
         tune(&tcp, &peer.to_string());
         crate::debug!("connection from {peer}, starting the handshake");

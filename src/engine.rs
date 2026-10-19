@@ -1,13 +1,16 @@
 use crate::archive::{archive_path, Archive};
+use crate::backup;
 use crate::classify::{self, Resolved, Verdict};
 use crate::fsutil::{timestamp_utc, ErrCtx};
-use crate::model::{cmp_path, metadata_matches, Action, BaseRow, Entry, Hash, Kind, Side};
+use crate::model::{
+    cmp_path, metadata_matches, Action, BaseRow, Entry, Hash, Kind, PathFailure, Side,
+};
 use crate::remote::{RemoteBackend, RemoteOptions};
-use crate::scan::{patterns_for, IgnoreRules};
+use crate::report::Reporter;
+use crate::scan::{absolute, patterns_for, IgnoreRules};
 use crate::side::{Backend, LocalBackend};
 use crate::tls;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -33,7 +36,7 @@ impl Mode {
 pub struct RunOptions {
     pub mode: Mode,
     pub dry_run: bool,
-    /// One-way only: remove paths that exist on the target but not the source.
+    /// One-way only: remove paths the source does not have.
     pub delete: bool,
     /// Override the mass-delete guard.
     pub force: bool,
@@ -44,6 +47,16 @@ pub struct RunOptions {
     pub default_ignores: bool,
     pub excludes: Vec<String>,
     pub archive_dir: PathBuf,
+    /// Where the version that is about to be replaced or removed is kept.
+    pub backup_dir: Option<PathBuf>,
+    /// Report as one JSON object per line instead of in prose.
+    pub json: bool,
+    /// Keep an interrupted transfer and continue it on the next run.
+    pub partial: bool,
+    /// Whether standard error is a terminal: the progress line is then drawn
+    /// in place. The progress goes to standard error, so that is the stream
+    /// the answer has to come from.
+    pub tty: bool,
     pub verbose: bool,
     pub quiet: bool,
 }
@@ -61,6 +74,10 @@ impl Default for RunOptions {
             default_ignores: true,
             excludes: Vec::new(),
             archive_dir: default_archive_dir(),
+            backup_dir: None,
+            json: false,
+            partial: false,
+            tty: false,
             verbose: false,
             quiet: false,
         }
@@ -125,6 +142,9 @@ impl Summary {
 struct Plan {
     actions: Vec<Action>,
     unchanged: u64,
+    /// Paths that could not even be planned. They are reported and counted;
+    /// the other paths carry on.
+    failures: Vec<PathFailure>,
 }
 
 /// Converge two local directories.
@@ -135,9 +155,10 @@ pub fn run(
     out: &mut dyn Write,
 ) -> io::Result<Summary> {
     validate_roots(local_root, remote_root)?;
+    let excluded = excluded_dirs(opts);
     let rules = IgnoreRules::load(local_root, opts.default_ignores, &opts.excludes)?;
-    let mut local = LocalBackend::new(local_root, rules.clone())?;
-    let mut remote = LocalBackend::new(remote_root, rules)?;
+    let mut local = LocalBackend::excluding(local_root, rules.clone(), excluded.clone())?;
+    let mut remote = LocalBackend::excluding(remote_root, rules, excluded)?;
     let key = remote_root.display().to_string();
     let label = remote_label(remote_root);
     run_pair(&mut local, &mut remote, local_root, &key, &label, opts, out)
@@ -158,12 +179,24 @@ pub fn run_tls(
     let rules = IgnoreRules::from_patterns(local_root, opts.default_ignores, &patterns)?;
     let identity = tls::Identity::load_or_create(&tls::data_dir())?;
     let mut far = RemoteBackend::connect(remote, &identity, pin, opts.default_ignores, &patterns)?;
-    let mut local = LocalBackend::new(local_root, rules)?;
+    let mut local = LocalBackend::excluding(local_root, rules, excluded_dirs(opts))?;
     let key = remote.label();
     let label = remote.host.clone();
     let outcome = run_pair(&mut local, &mut far, local_root, &key, &label, opts, out);
     let closed = far.finish();
     outcome.and_then(|summary| closed.map(|()| summary))
+}
+
+/// The directories the local tree must never walk into.
+///
+/// The backup directory holds copies of files that are on their way out; they
+/// must not travel back into the pair, and the directory must not be walked at
+/// all even when it sits inside the synced root.
+fn excluded_dirs(opts: &RunOptions) -> Vec<PathBuf> {
+    match &opts.backup_dir {
+        Some(dir) => vec![absolute(dir)],
+        None => Vec::new(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -197,13 +230,25 @@ fn run_pair(
     );
 
     let stamp = timestamp_utc();
+    let mut reporter = Reporter::new(out, opts);
     let plan = build_plan(local, remote, &archive, opts, conflict_label, &stamp)?;
 
-    crate::info!(
-        "plan: {} actions, {} paths already agree",
-        plan.actions.len(),
-        plan.unchanged
-    );
+    // The JSON stream starts with the plan: it is what the run intends to do,
+    // before anything is attempted.
+    if opts.json {
+        reporter.plan(&plan.actions)?;
+        reporter.conflict_and_skip_events(&plan.actions)?;
+    }
+
+    let mut summary = Summary {
+        unchanged: plan.unchanged,
+        failures: plan.failures.len() as u64,
+        ..Default::default()
+    };
+    for failure in &plan.failures {
+        reporter.path_error(&failure.path, &failure.message)?;
+    }
+
     let planned_deletes = plan
         .actions
         .iter()
@@ -212,18 +257,27 @@ fn run_pair(
     let limit = std::cmp::max(100, tracked / 4);
     // A dry run is a report, not a decision: never block it, and never let it write.
     if !opts.dry_run && planned_deletes > limit && !opts.force {
-        writeln!(
-            out,
-            "refusing to delete {planned_deletes} of {tracked} tracked paths (guard limit {limit})"
-        )?;
-        for action in plan.actions.iter().take(10) {
-            writeln!(out, "  {}", action.describe())?;
+        if reporter.is_json() {
+            reporter.notice(&format!(
+                "refusing to delete {planned_deletes} of {tracked} tracked paths (guard limit {limit}); \
+                 re-run with --force if this is what you want"
+            ))?;
+        } else {
+            reporter.notice(&format!(
+                "refusing to delete {planned_deletes} of {tracked} tracked paths (guard limit {limit})"
+            ))?;
+            for action in plan.actions.iter().take(10) {
+                writeln!(reporter.out(), "  {}", action.describe())?;
+            }
+            reporter.notice("re-run with --force if this is what you want")?;
         }
-        writeln!(out, "re-run with --force if this is what you want")?;
-        return Ok(Summary {
+        let aborted = Summary {
             aborted: true,
-            ..Default::default()
-        });
+            ..summary
+        };
+        reporter.summary(&aborted)?;
+        reporter.finish()?;
+        return Ok(aborted);
     }
 
     let consequential = plan
@@ -232,85 +286,93 @@ fn run_pair(
         .filter(|a| !matches!(a, Action::Skip { .. }))
         .count();
     if first_run && consequential > 0 && !opts.auto && !opts.dry_run {
-        writeln!(
-            out,
-            "this pair has never been synced ({consequential} actions planned); showing what would happen"
-        )?;
-        print_plan(&plan.actions, opts, out)?;
-        writeln!(out, "re-run with --auto to proceed")?;
-        return Ok(Summary {
+        if reporter.is_json() {
+            reporter.notice(&format!(
+                "this pair has never been synced ({consequential} actions planned); \
+                 re-run with --auto to proceed"
+            ))?;
+        } else {
+            reporter.notice(&format!(
+                "this pair has never been synced ({consequential} actions planned); \
+                 showing what would happen"
+            ))?;
+            reporter.plan(&plan.actions)?;
+            reporter.notice("re-run with --auto to proceed")?;
+        }
+        let needs_consent = Summary {
             needs_consent: true,
-            ..Default::default()
-        });
+            ..summary
+        };
+        reporter.summary(&needs_consent)?;
+        reporter.finish()?;
+        return Ok(needs_consent);
     }
 
     if opts.dry_run {
-        print_plan(&plan.actions, opts, out)?;
-        if !opts.quiet {
-            report_skips(&plan.actions, out)?;
+        if !opts.json {
+            reporter.plan(&plan.actions)?;
         }
-        return Ok(summary_of(&plan));
-    }
-    if opts.verbose {
-        print_plan(&plan.actions, opts, out)?;
+        if !opts.quiet {
+            reporter.skip_report(&plan.actions)?;
+        }
+        let summary = summary_of(&plan);
+        reporter.summary(&summary)?;
+        reporter.finish()?;
+        return Ok(summary);
     }
 
-    let mut summary = Summary {
-        unchanged: plan.unchanged,
-        ..Default::default()
-    };
+    if opts.verbose && !opts.json {
+        reporter.plan(&plan.actions)?;
+    }
+
+    reporter.set_total(planned_bytes(&plan.actions));
     for action in &plan.actions {
         crate::debug!("applying: {}", action.describe());
-        match apply(action, local, remote, local_root, &archive, &mut summary) {
+        match apply(
+            action,
+            local,
+            remote,
+            local_root,
+            &archive,
+            &mut summary,
+            &mut reporter,
+            opts,
+            &stamp,
+        ) {
             Ok(()) => {
                 // A file that reappears because the other side deleted it is rare
                 // and consequential; say so even without -v.
-                if !opts.quiet && matches!(action, Action::Resurrect { .. }) {
-                    writeln!(out, "  {}", action.describe())?;
+                if !opts.quiet && !reporter.is_json() && matches!(action, Action::Resurrect { .. })
+                {
+                    writeln!(reporter.out(), "  {}", action.describe())?;
                 }
             }
-            Err(e) => {
+            Err(error) => {
                 summary.failures += 1;
-                writeln!(out, "error: {} :: {e}", action.describe())?;
+                reporter.action_error(action, &error.to_string())?;
             }
         }
     }
+    // The progress line is closed before the report: the summary must start on
+    // a line of its own.
+    reporter.finish()?;
+    reporter.text_summary(&summary)?;
     if !opts.quiet {
-        writeln!(
-            out,
-            "created {}, updated {}, deleted {}, conflicts {}, skipped {}, failures {}, unchanged {}",
-            summary.created,
-            summary.updated,
-            summary.deleted,
-            summary.conflicts,
-            summary.skipped,
-            summary.failures,
-            summary.unchanged
-        )?;
-        if summary.conflicts > 0 {
-            writeln!(
-                out,
-                "both versions were kept; look for files named *.conflict-*"
-            )?;
-        }
-        report_skips(&plan.actions, out)?;
+        reporter.skip_report(&plan.actions)?;
     }
+    reporter.summary(&summary)?;
     Ok(summary)
 }
 
-/// A bare "skipped 7" reads like a failure. Say what was skipped and what to do
-/// about it, even without -v.
-fn report_skips(actions: &[Action], out: &mut dyn Write) -> io::Result<()> {
-    let mut reasons: BTreeMap<&'static str, u64> = BTreeMap::new();
-    for action in actions {
-        if let Action::Skip { reason, .. } = action {
-            *reasons.entry(reason).or_default() += 1;
-        }
-    }
-    for (reason, count) in reasons {
-        writeln!(out, "{count} skipped: {reason}")?;
-    }
-    Ok(())
+/// How many bytes the plan intends to move.
+fn planned_bytes(actions: &[Action]) -> u64 {
+    actions
+        .iter()
+        .map(|action| match action {
+            Action::Copy { size, .. } | Action::Resurrect { size, .. } => *size,
+            _ => 0,
+        })
+        .sum()
 }
 
 fn build_plan(
@@ -323,6 +385,7 @@ fn build_plan(
 ) -> io::Result<Plan> {
     let mut actions = Vec::new();
     let mut unchanged = 0u64;
+    let mut failures: Vec<PathFailure> = Vec::new();
 
     let mut lnext = local.walk()?;
     let mut rnext = remote.walk()?;
@@ -330,35 +393,59 @@ fn build_plan(
     loop {
         let (take_local, take_remote) = match (&lnext, &rnext) {
             (None, None) => break,
-            (Some(l), Some(r)) => match cmp_path(&l.path, &r.path) {
+            (Some(Ok(l)), Some(Ok(r))) => match cmp_path(&l.path, &r.path) {
                 Ordering::Equal => (true, true),
                 Ordering::Less => (true, false),
                 Ordering::Greater => (false, true),
             },
-            (Some(_), None) => (true, false),
-            (None, Some(_)) => (false, true),
+            (Some(Ok(_)), None) => (true, false),
+            (None, Some(Ok(_))) => (false, true),
+            // A path that could not be read is reported on its own; the walk
+            // carries on with the paths that can be read.
+            (Some(Err(_)), _) => (true, false),
+            (_, Some(Err(_))) => (false, true),
         };
         let l = if take_local { lnext.take() } else { None };
         let r = if take_remote { rnext.take() } else { None };
-        let path = l
-            .as_ref()
-            .or(r.as_ref())
-            .map(|e| e.path.clone())
-            .expect("one side is always present here");
 
-        handle_path(
-            &path,
-            l.as_ref(),
-            r.as_ref(),
-            local,
-            remote,
-            archive,
-            opts,
-            label,
-            stamp,
-            &mut actions,
-            &mut unchanged,
-        )?;
+        let mut l_entry: Option<Entry> = None;
+        let mut r_entry: Option<Entry> = None;
+        match l {
+            Some(Ok(entry)) => l_entry = Some(entry),
+            Some(Err(failure)) => failures.push(failure),
+            None => {}
+        }
+        match r {
+            Some(Ok(entry)) => r_entry = Some(entry),
+            Some(Err(failure)) => failures.push(failure),
+            None => {}
+        }
+
+        let path = l_entry
+            .as_ref()
+            .or(r_entry.as_ref())
+            .map(|entry| entry.path.clone());
+        if let Some(path) = path {
+            // One path that cannot be planned must not stop the others.
+            if let Err(error) = handle_path(
+                &path,
+                l_entry.as_ref(),
+                r_entry.as_ref(),
+                local,
+                remote,
+                archive,
+                opts,
+                label,
+                stamp,
+                &mut actions,
+                &mut unchanged,
+            ) {
+                failures.push(PathFailure {
+                    path,
+                    message: error.to_string(),
+                });
+            }
+        }
 
         if take_local {
             lnext = local.walk()?;
@@ -373,9 +460,27 @@ fn build_plan(
     // deletions.
     let mut forgotten = Vec::new();
     archive.for_each(|path, _row| {
-        let here = local.stat(path)?.is_some();
-        let there = remote.stat(path)?.is_some();
-        if !here && !there {
+        let here = match local.stat(path) {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(PathFailure {
+                    path: path.to_path_buf(),
+                    message: format!("checking {}: {error}", path.display()),
+                });
+                return Ok(());
+            }
+        };
+        let there = match remote.stat(path) {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(PathFailure {
+                    path: path.to_path_buf(),
+                    message: format!("checking {}: {error}", path.display()),
+                });
+                return Ok(());
+            }
+        };
+        if here.is_none() && there.is_none() {
             forgotten.push(Action::Forget {
                 path: path.to_path_buf(),
             });
@@ -384,7 +489,11 @@ fn build_plan(
     })?;
     actions.extend(forgotten);
 
-    Ok(Plan { actions, unchanged })
+    Ok(Plan {
+        actions,
+        unchanged,
+        failures,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -660,19 +769,10 @@ fn validate_roots(local_root: &Path, remote_root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn print_plan(actions: &[Action], opts: &RunOptions, out: &mut dyn Write) -> io::Result<()> {
-    for action in actions {
-        if matches!(action, Action::Adopt { .. } | Action::Skip { .. }) && !opts.verbose {
-            continue;
-        }
-        writeln!(out, "  {}", action.describe())?;
-    }
-    Ok(())
-}
-
 fn summary_of(plan: &Plan) -> Summary {
     let mut summary = Summary {
         unchanged: plan.unchanged,
+        failures: plan.failures.len() as u64,
         ..Default::default()
     };
     for action in &plan.actions {
@@ -696,6 +796,7 @@ fn summary_of(plan: &Plan) -> Summary {
 
 /// Apply one planned action. Nothing here is discovered at run time: the plan is
 /// the whole story, which is what makes `--dry-run` trustworthy.
+#[allow(clippy::too_many_arguments)]
 fn apply(
     action: &Action,
     local: &mut dyn Backend,
@@ -703,16 +804,24 @@ fn apply(
     local_root: &Path,
     archive: &Archive,
     summary: &mut Summary,
+    reporter: &mut Reporter<'_>,
+    opts: &RunOptions,
+    stamp: &str,
 ) -> io::Result<()> {
     match action {
         Action::Copy {
             from,
             to,
             path,
+            size,
             new_file,
-            ..
         } => {
-            let hash = transfer(*from, *to, path, remote, local_root)?;
+            // The old version is kept before it is replaced: if the backup
+            // cannot be written, the file is left alone.
+            backup_before(*to, path, local, remote, opts, stamp)?;
+            reporter.transfer_start(path, *from, *to, *size)?;
+            let hash = transfer_with_retry(*from, *to, path, remote, local_root, opts)?;
+            reporter.transfer_done(path, *from, *to, *size)?;
             record(local, remote, path, hash, archive)?;
             if *new_file {
                 summary.created += 1;
@@ -720,12 +829,21 @@ fn apply(
                 summary.updated += 1;
             }
         }
-        Action::Resurrect { from, to, path, .. } => {
-            let hash = transfer(*from, *to, path, remote, local_root)?;
+        Action::Resurrect {
+            from,
+            to,
+            path,
+            size,
+        } => {
+            backup_before(*to, path, local, remote, opts, stamp)?;
+            reporter.transfer_start(path, *from, *to, *size)?;
+            let hash = transfer_with_retry(*from, *to, path, remote, local_root, opts)?;
+            reporter.transfer_done(path, *from, *to, *size)?;
             record(local, remote, path, hash, archive)?;
             summary.created += 1;
         }
         Action::Delete { side, path } => {
+            backup_before(*side, path, local, remote, opts, stamp)?;
             match side {
                 Side::Local => local.remove(path)?,
                 Side::Remote => remote.remove(path)?,
@@ -734,14 +852,17 @@ fn apply(
             summary.deleted += 1;
         }
         Action::Conflict { path, copy, .. } => {
+            // The remote's file at this name is about to be replaced by the
+            // local one; the other version is kept under the conflict name.
+            backup_before(Side::Remote, path, local, remote, opts, stamp)?;
             let local_original = local_root.join(path);
             let local_copy = local_root.join(copy);
 
             // The local version wins the original name; the other side's version
             // is preserved under the conflict name. Both sides end up with both.
-            let loser = remote.get(path, &local_copy)?;
-            let winner = remote.put(path, &local_original)?;
-            remote.put(copy, &local_copy)?;
+            let loser = remote.get(path, &local_copy, false)?;
+            let winner = remote.put(path, &local_original, false)?;
+            remote.put(copy, &local_copy, false)?;
 
             record(local, remote, path, winner, archive)?;
             record(local, remote, copy, loser, archive)?;
@@ -761,22 +882,55 @@ fn apply(
     Ok(())
 }
 
+/// Keep the version that is about to be replaced or removed.
+fn backup_before(
+    side: Side,
+    path: &Path,
+    local: &mut dyn Backend,
+    remote: &mut dyn Backend,
+    opts: &RunOptions,
+    stamp: &str,
+) -> io::Result<()> {
+    let Some(dir) = opts.backup_dir.as_ref() else {
+        return Ok(());
+    };
+    backup::take(side, path, local, remote, dir, stamp)?;
+    Ok(())
+}
+
 fn transfer(
     from: Side,
     to: Side,
     path: &Path,
     remote: &mut dyn Backend,
     local_root: &Path,
+    resume: bool,
 ) -> io::Result<Hash> {
     match (from, to) {
         // The local file is named by its absolute path on this machine.
-        (Side::Local, Side::Remote) => remote.put(path, &local_root.join(path)),
-        (Side::Remote, Side::Local) => remote.get(path, &local_root.join(path)),
+        (Side::Local, Side::Remote) => remote.put(path, &local_root.join(path), resume),
+        (Side::Remote, Side::Local) => remote.get(path, &local_root.join(path), resume),
         (side, _) => Err(io::Error::other(format!(
             "cannot copy from the {} side to itself",
             side.name()
         ))),
     }
+}
+
+/// A file whose content does not verify is worth one more try: the transfer
+/// starts over from the beginning. A second failure fails the file, and the
+/// other files carry on.
+fn transfer_with_retry(
+    from: Side,
+    to: Side,
+    path: &Path,
+    remote: &mut dyn Backend,
+    local_root: &Path,
+    opts: &RunOptions,
+) -> io::Result<Hash> {
+    crate::fsutil::retry_once(&path.display().to_string(), || {
+        transfer(from, to, path, remote, local_root, opts.partial)
+    })
 }
 
 /// Both sides now agree; remember what they agree on. The hash is the one the

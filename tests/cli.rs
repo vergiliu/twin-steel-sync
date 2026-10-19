@@ -157,3 +157,78 @@ fn a_new_pair_without_consent_reports_and_writes_nothing() {
     );
     assert!(!sandbox.remote.join("a.txt").exists());
 }
+
+/// F-015: a dry run is a report, not a decision. It exits 0 even when the
+/// plan holds a conflict; `twin verify` keeps its own contract.
+#[test]
+fn a_dry_run_exits_zero_even_when_the_plan_holds_a_conflict() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.local.join("doc.txt"), "base").unwrap();
+    sandbox.sync();
+
+    fs::write(sandbox.local.join("doc.txt"), "mine").unwrap();
+    fs::write(sandbox.remote.join("doc.txt"), "theirs").unwrap();
+
+    let (code, output) = sandbox.run(&[
+        "sync",
+        sandbox.local.to_str().unwrap(),
+        sandbox.remote.to_str().unwrap(),
+        "--auto",
+        "--dry-run",
+    ]);
+    assert_eq!(code, 0, "a dry run is not a failure: {output}");
+    assert!(
+        output.contains("conflict"),
+        "the plan must be shown: {output}"
+    );
+
+    // `twin verify` is the exception: it reports the difference with 3.
+    let (code, output) = sandbox.verify();
+    assert_eq!(code, 3, "verify keeps its own contract: {output}");
+}
+
+/// F-029: a path that cannot be read fails on its own. The other paths carry
+/// on and the run ends with the partial exit code.
+#[test]
+fn a_file_that_cannot_be_read_fails_alone() {
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root reads everything: nothing to assert
+    }
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.local.join("bad.txt"), "unreadable").unwrap();
+    fs::write(sandbox.local.join("good.txt"), "fine").unwrap();
+
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(
+        sandbox.local.join("bad.txt"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let (code, output) = sandbox.run(&[
+        "sync",
+        sandbox.local.to_str().unwrap(),
+        sandbox.remote.to_str().unwrap(),
+        "--auto",
+    ]);
+    assert_eq!(code, 4, "one file failed: {output}");
+    assert!(
+        output.contains("bad.txt"),
+        "the failure must name the path: {output}"
+    );
+    assert!(
+        output.contains("failures 1"),
+        "the failure must be counted: {output}"
+    );
+    assert!(
+        sandbox.remote.join("good.txt").exists(),
+        "the other files must carry on: {output}"
+    );
+    assert!(!sandbox.remote.join("bad.txt").exists());
+
+    fs::set_permissions(
+        sandbox.local.join("bad.txt"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+}

@@ -49,7 +49,7 @@ Comparison per path — current local vs archive vs current remote:
 | F-012 | `--checksum` / `--fast` | `--checksum` hashes every tracked file on both sides; `--fast` trusts size+mtime and skips hashing entirely |
 | F-013 | Streaming merge-walk | Both sides walked in sorted order and merged; plan memory is bounded per directory, not by tree size (500k files must not blow RSS) |
 | F-014 | Hash memoization | Hashes live in the archive, so unchanged files are never rehashed across runs |
-| F-015 | Plan output | `--dry-run` prints every action (create, update, delete, conflict, skip-with-reason) with sizes; exits 0 |
+| F-015 | Plan output | `--dry-run` prints every action (create, update, delete, conflict, skip-with-reason) with sizes; exits 0, conflicts included — `twin verify` is the exception and keeps its own contract (0 in sync, 3 different) |
 | F-016 | Plan/apply equivalence | The set of actions reported by `--dry-run` equals the set the real run performs — enforced by one test comparing plan output against an instrumented run |
 
 ## 3. Transfer
@@ -58,14 +58,14 @@ Comparison per path — current local vs archive vs current remote:
 |---|---|---|
 | F-020 | Whole-file transfer | Files move whole; no block-level delta, no chunk store |
 | F-021 | Atomic placement | Write to `.twin-tmp-*` in the destination directory → fsync → `rename()`. No partial file ever exists under its real name (dir fsync on Linux, `F_FULLFSYNC` on macOS) |
-| F-022 | Verified bytes | Hash the source while reading (torn reads caught) and re-verify the received file; mismatch → retry once, then fail the file and continue |
-| F-023 | Resume with `--partial` | Interrupted transfers keep their temp file; the next run appends and verifies the finished hash — a bad prefix fails the hash and triggers a clean retransfer |
+| F-022 | Verified bytes | Hash the source while reading (torn reads caught) and re-verify the received file; mismatch → retry once, then fail the file and continue (counted, exit code 4) |
+| F-023 | Resume with `--partial` | Interrupted transfers keep their temp file; the next run appends and verifies the finished hash — a bad prefix fails the hash and triggers a clean retransfer. The temp file is named after the destination, so the next run finds it; the wire protocol carries byte offsets (protocol version 2). Without the flag a transfer starts over and the temp file is removed |
 | F-024 | Sequential, one connection | Files transfer one at a time over a single TLS connection per run; no muxing, no per-file connections |
 | F-025 | Transport | TCP + **mutual TLS 1.3** (rustls, ring). Both ends hold a self-signed ECDSA P-256 key pair; each trusts the other by pinned certificate fingerprint — no CA, no accounts. `twin serve --root DIR --listen ADDR` serves; the protocol frames ride the TLS stream |
 | F-026 | Local pairs | A path instead of `host:port` → plain filesystem copy path; identical semantics, no network involved |
-| F-027 | Path confinement | The server refuses anything outside `--root`; the client refuses anything outside its local root: `..`, absolute paths, and symlinked ancestors rejected |
+| F-027 | Path confinement | The server refuses anything outside `--root`; the client refuses anything outside its local root: `..`, absolute paths, and symlinked ancestors rejected (the server half is done; the client half is still open) |
 | F-028 | Protocol version handshake | First frame exchanges `twin` protocol versions; mismatch → actionable error, never silent misbehavior. A client whose fingerprint is not authorized is refused during the TLS handshake |
-| F-029 | Disk-full / EIO | Per-file failure (ENOSPC, EACCES, I/O error) is reported with the path and errno, other files continue, exit code 4 |
+| F-029 | Disk-full / EIO | Per-file failure (ENOSPC, EACCES, I/O error) is reported with the path and errno, other files continue, exit code 4 — including a file that cannot be read while the plan is being built |
 
 ## 4. Deletions, conflicts, backup
 
@@ -75,7 +75,7 @@ Comparison per path — current local vs archive vs current remote:
 | F-031 | Mass-delete guard | A run that would delete more than max(100, 25 %) of tracked paths aborts before touching anything, listing what it would remove; `--force` overrides |
 | F-032 | Conflict = keep both | Conflicting versions are preserved side by side as `<name>.conflict-<YYYYMMDD-HHMMSS>-<host>`; the local file keeps its name; both are reported and both converge afterwards |
 | F-033 | Conflict exit status | Conflicts do not fail the run; exit code 3 means "converged, N conflicts kept" |
-| F-034 | `--backup DIR` | Before overwriting or deleting anything, the old version is copied to `DIR` with a timestamped name. Roughly 30 lines, prevents most "oops" |
+| F-034 | `--backup DIR` | Before overwriting or deleting anything, the old version is copied to `DIR` with a timestamped name, keeping the path under `DIR`. The backup lands on the client in both directions (the far side's version is fetched before it is overwritten); the backup directory is never synced, and a backup that cannot be written fails that file instead of being skipped |
 | F-035 | Resurrections reported | A path deleted on one side but modified on the other is kept and explicitly listed, never silently re-created or silently dropped |
 
 ## 5. Ignore rules
@@ -101,9 +101,9 @@ twin serve --root <dir>       # serve a directory over mutual TLS
 | ID | Requirement | Acceptance |
 |---|---|---|
 | F-050 | Flags | `--dry-run --json --quiet -v --delete --force --checksum --fast --partial --backup DIR --exclude PAT --no-default-ignores --auto --pin HEX`. No config file; no state outside the data directory (`identity/`, `known_hosts`, `authorized_clients`, `archive/`) |
-| F-051 | Exit codes | 0 converged · 1 error · 2 usage · 3 converged with conflicts · 4 partial (some files failed) |
-| F-052 | `--json` events | One JSON object per line: plan entry, transfer start/finish, conflict, skip, error, summary. Enough to build a UI on later |
-| F-053 | Progress | TTY: current file, bytes, running total, ETA. Non-TTY: one line per completed file. `NO_COLOR` respected |
+| F-051 | Exit codes | 0 converged · 1 error · 2 usage · 3 converged with conflicts · 4 partial (some files failed). A dry run exits 0 unless files failed |
+| F-052 | `--json` events | One JSON object per line: plan entry, transfer start/finish, conflict, skip, error, summary; the last line is always the summary, and paths are relative to the synced root. Enough to build a UI on later |
+| F-053 | Progress | TTY: current file, bytes, running total, ETA, drawn in place on standard error. Non-TTY: one line per completed file. The program prints no colour at all, so `NO_COLOR` has nothing to suppress |
 | F-054 | Output restraint | Default output is a short summary; `-v` adds per-file lines; `--quiet` prints only errors |
 | F-055 | Diagnostics | Failures name the operation and the path (`storing /srv/docs/a.txt: ...`), never a bare errno. Leveled diagnostics on stderr, off by default, raised by `-v`/`-vv` or `TWIN_LOG=error\|warn\|info\|debug` |
 | F-056 | `twin doctor [PATH] [--remote ADDR --pin HEX]` | Probes the data dir, identity (key permissions, key↔cert usability), temp dir, archive integrity, free space, and the sync root's real abilities — create, atomic replace, mtime precision, fsync — plus whether this host's own network policy lets this program be reached on the local network (macOS firewall / local-network permission), naming the fixes that work — an ad-hoc signature (`codesign -s - -f --identifier dev.twin.cli <binary>`, no password needed), a firewall allowance, or granting Local Network access — and warning that a running server keeps the decision it started with. Then TCP/TLS/handshake/listing against a server. One line per check; exits 1 if anything failed |
@@ -148,13 +148,15 @@ N machines with no hub = N(N−1)/2 pairs; fine for 2–4 devices, and each pair
 | F-073 | Crash test | SIGKILL mid-transfer; assert no partial files under real names, archive consistent, next run converges |
 | F-074 | Two-platform CI | `cargo fmt`, `clippy -D warnings`, `cargo test` on macOS and Linux. Nothing else |
 
+`.github/workflows/ci.yml` runs the three commands on both platforms. The 10k-file tree of F-071 is the one slow test — F-021 puts every file through an fsync, and on macOS that fsync is an `F_FULLFSYNC`, so ten thousand files cost minutes — so it is `#[ignore]`d in the default run and gets a job of its own (`cargo test --test scale -- --ignored`), where it can take as long as it needs. The crash test of F-073 runs a real `twin serve` on loopback, kills the client with SIGKILL while a 256 MiB transfer is in flight, and then asserts the three things that matter: no file under a real name is partial, the archive never records what was not verified, and the next run converges.
+
 ## 10. Build order (why this is finishable)
 
 1. Compare + plan + `--dry-run` (pure functions over two directory walks) — testable with zero I/O risk. **Done**
-2. Local pair transfer with archive, atomic placement, `--backup`. **Done, except `--backup` (F-034)**
-3. Remote transport + `serve` + handshake + resume. **Done over mutual TLS (`twin serve`, `twin id`, `twin authorize`, pinning); resume (F-023/`--partial`) still open**
+2. Local pair transfer with archive, atomic placement, `--backup`. **Done**
+3. Remote transport + `serve` + handshake + resume. **Done over mutual TLS (`twin serve`, `twin id`, `twin authorize`, pinning), with `--partial` (F-023) resuming an interrupted transfer**
 4. Deletions, conflict copies, guards. **Done**
-5. `--json`, progress, exit codes, docs. **Exit codes, diagnostics and `twin doctor` (F-054/F-055/F-056) done; `--json` (F-052) and progress (F-053) still open**
+5. `--json`, progress, exit codes, docs. **Done: `--json` (F-052), progress (F-053), exit codes (F-051/F-015), diagnostics and `twin doctor` (F-054/F-055/F-056)**
 
 On macOS a binary must be signed before the system lets it serve the local network, so the build signs what it produces: `make build` / `make release` run `scripts/codesign-macos.sh` (ad-hoc, no certificate and no sudo; a no-op on Linux, and it skips an already-signed file). `twin serve` warns at startup when the running binary is unsigned, and `twin doctor` reports `binary signature` next to `local network accepts connections`.
 

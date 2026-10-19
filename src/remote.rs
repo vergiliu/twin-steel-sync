@@ -3,13 +3,13 @@
 //! which it is talking to.
 
 use crate::fsutil::{fsync_hard, hash_file, mtime_ns, sync_dir, ErrCtx};
-use crate::model::{Entry, Hash};
+use crate::model::{Entry, Hash, PathFailure};
 use crate::proto::{self, Frame, AGENT, PROTOCOL_VERSION, STATUS_MISSING, STATUS_OK};
 use crate::side::Backend;
 use crate::tls;
 use rustls::{ClientConfig, ClientConnection};
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,7 +20,8 @@ static SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn handshake_error(label: &str, error: io::Error) -> io::Error {
     let text = error.to_string();
     let hint = if text.contains("alert") || text.contains("certificate") {
-        "this client is not allowed there: run `twin id` here, then `twin authorize <fingerprint>` on the server"
+        "this client is not allowed there: run `twin id` here, then `twin authorize <fingerprint>` \
+         on the server — it takes effect on the next connection"
     } else {
         "the other side did not speak the twin protocol"
     };
@@ -127,6 +128,9 @@ impl RemoteBackend {
             } => {
                 if status == STATUS_OK {
                     Ok(hash)
+                } else if proto::is_hash_mismatch(&message) {
+                    // A hash that does not match is worth one more try.
+                    Err(crate::fsutil::verification_error(message))
                 } else {
                     Err(io::Error::other(if message.is_empty() {
                         "the other side refused the request".to_string()
@@ -174,6 +178,119 @@ impl RemoteBackend {
         ));
         Ok(())
     }
+
+    /// How much of the file the far end already holds. A partial file that is
+    /// longer than the source belongs to an older version and cannot be
+    /// continued.
+    fn remote_offset(&mut self, path: &Path, size: u64) -> io::Result<u64> {
+        self.send(&Frame::ResumeQuery(path.to_path_buf()))?;
+        let have = match self.receive()? {
+            Frame::ResumeReply { size } => size,
+            Frame::Ack { message, .. } => {
+                return Err(io::Error::other(if message.is_empty() {
+                    "the other side refused the request".to_string()
+                } else {
+                    message
+                }))
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "expected a resume reply, got {other:?}"
+                )))
+            }
+        };
+        Ok(if have > size { 0 } else { have })
+    }
+
+    /// Ask for the bytes from `offset` on and put the file in place.
+    fn fetch(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        tmp: &Path,
+        local_dst: &Path,
+        parent: &Path,
+        keep_partial: bool,
+    ) -> io::Result<Hash> {
+        self.send(&Frame::GetRange {
+            path: path.to_path_buf(),
+            offset,
+        })?;
+        let (size, mtime, expected) = match self.receive()? {
+            Frame::DataBegin {
+                size,
+                mtime_ns,
+                hash,
+            } => (size, mtime_ns, hash),
+            Frame::Ack {
+                status, message, ..
+            } => {
+                return Err(io::Error::other(if status == STATUS_MISSING {
+                    format!("the other side no longer has {}", path.display())
+                } else if message.is_empty() {
+                    "the other side refused the request".to_string()
+                } else {
+                    message
+                }))
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "expected file data, got {other:?}"
+                )))
+            }
+        };
+
+        let outcome = (|| -> io::Result<Hash> {
+            let mut writer = BufWriter::with_capacity(
+                256 * 1024,
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(tmp)
+                    .ctx(|| format!("opening {}", tmp.display()))?,
+            );
+            proto::read_stream(&mut self.stream, &mut writer)?;
+            writer.flush()?;
+            fsync_hard(writer.get_ref())?;
+            drop(writer);
+            // The whole file is verified, the prefix included.
+            let got = hash_file(tmp).ctx(|| format!("hashing {}", tmp.display()))?;
+            if got != expected {
+                return Err(crate::fsutil::verification_error(
+                    "received content does not match the hash the other side announced",
+                ));
+            }
+            let total = fs::metadata(tmp)?.len();
+            if total != size {
+                return Err(crate::fsutil::verification_error(format!(
+                    "expected {size} bytes, received {total}"
+                )));
+            }
+            crate::fsutil::apply_mtime(tmp, mtime, "storing");
+            fs::rename(tmp, local_dst).ctx(|| {
+                format!(
+                    "moving {} into place at {}",
+                    tmp.display(),
+                    local_dst.display()
+                )
+            })?;
+            let _ = sync_dir(parent);
+            Ok(expected)
+        })();
+        match outcome.as_ref().err() {
+            // A file that does not verify is of no use to anyone.
+            Some(error) if crate::fsutil::is_verification_error(error) => {
+                let _ = fs::remove_file(tmp);
+            }
+            // An interrupted transfer keeps what it has, so the next run can
+            // continue it. Without a resume the partial file goes.
+            Some(_) if !keep_partial => {
+                let _ = fs::remove_file(tmp);
+            }
+            _ => {}
+        }
+        outcome
+    }
 }
 
 impl Drop for RemoteBackend {
@@ -187,7 +304,7 @@ impl Backend for RemoteBackend {
         &self.label
     }
 
-    fn walk(&mut self) -> io::Result<Option<Entry>> {
+    fn walk(&mut self) -> io::Result<Option<Result<Entry, PathFailure>>> {
         if !self.listing_done && self.spool.is_none() {
             self.read_listing()?;
         }
@@ -196,7 +313,7 @@ impl Backend for RemoteBackend {
         }
         let spool = self.spool.as_mut().expect("spool is open while listing");
         match proto::read_frame(spool)? {
-            Frame::Entry(entry) => Ok(Some(entry)),
+            Frame::Entry(entry) => Ok(Some(Ok(entry))),
             Frame::EndList => {
                 self.listing_done = true;
                 Ok(None)
@@ -222,7 +339,7 @@ impl Backend for RemoteBackend {
         }
     }
 
-    fn put(&mut self, path: &Path, local_src: &Path) -> io::Result<Hash> {
+    fn put(&mut self, path: &Path, local_src: &Path, resume: bool) -> io::Result<Hash> {
         crate::debug!("sending {}", path.display());
         let meta = fs::metadata(local_src).ctx(|| format!("stat {}", local_src.display()))?;
         if !meta.is_file() {
@@ -231,20 +348,43 @@ impl Backend for RemoteBackend {
                 local_src.display()
             )));
         }
+        let size = meta.len();
         // Hash before sending: the far end verifies what it receives against it.
-        let expected = hash_file(local_src)?;
-        self.send(&Frame::Push {
-            path: path.to_path_buf(),
-            size: meta.len(),
-            mtime_ns: mtime_ns(&meta),
-            hash: expected,
-        })?;
-        let actual = proto::write_stream(
-            &mut BufReader::new(File::open(local_src)?),
-            &mut self.stream,
-        )?;
+        let expected = hash_file(local_src).ctx(|| format!("hashing {}", local_src.display()))?;
+
+        // How much of the file the far end already holds, if the transfer may
+        // be continued.
+        let offset = if resume {
+            self.remote_offset(path, size)?
+        } else {
+            0
+        };
+
+        if offset > 0 {
+            self.send(&Frame::PushRange {
+                path: path.to_path_buf(),
+                size,
+                mtime_ns: mtime_ns(&meta),
+                hash: expected,
+                offset,
+            })?;
+        } else {
+            self.send(&Frame::Push {
+                path: path.to_path_buf(),
+                size,
+                mtime_ns: mtime_ns(&meta),
+                hash: expected,
+            })?;
+        }
+        let mut reader = BufReader::new(File::open(local_src)?);
+        if offset > 0 {
+            reader
+                .seek(SeekFrom::Start(offset))
+                .ctx(|| format!("seeking in {}", local_src.display()))?;
+        }
+        let actual = proto::write_stream(&mut reader, &mut self.stream)?;
         self.stream.flush()?;
-        if actual != expected {
+        if offset == 0 && actual != expected {
             return Err(io::Error::other(
                 "the file changed while it was being sent; nothing was written remotely",
             ));
@@ -252,70 +392,40 @@ impl Backend for RemoteBackend {
         self.expect_ack()
     }
 
-    fn get(&mut self, path: &Path, local_dst: &Path) -> io::Result<Hash> {
+    fn get(&mut self, path: &Path, local_dst: &Path, resume: bool) -> io::Result<Hash> {
         crate::debug!("receiving {}", path.display());
-        self.send(&Frame::Get(path.to_path_buf()))?;
-        let (size, mtime, expected) = match self.receive()? {
-            Frame::DataBegin {
-                size,
-                mtime_ns,
-                hash,
-            } => (size, mtime_ns, hash),
-            Frame::Ack {
-                status, message, ..
-            } => {
-                return Err(io::Error::other(if status == STATUS_MISSING {
-                    format!("the other side no longer has {}", path.display())
-                } else {
-                    message
-                }))
-            }
-            other => {
-                return Err(io::Error::other(format!(
-                    "expected file data, got {other:?}"
-                )))
-            }
-        };
-
         let parent = local_dst.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent")
         })?;
         fs::create_dir_all(parent)?;
-        let tmp = parent.join(format!(".twin-tmp-{}-recv", std::process::id()));
-        let outcome = (|| -> io::Result<Hash> {
-            let mut writer = BufWriter::with_capacity(256 * 1024, File::create(&tmp)?);
-            let written = proto::read_stream(&mut self.stream, &mut writer)?;
-            writer.flush()?;
-            fsync_hard(writer.get_ref())?;
-            drop(writer);
-            if written != expected {
-                return Err(io::Error::other(
-                    "received content does not match the hash the other side announced",
-                ));
-            }
-            let got = fs::metadata(&tmp)?.len();
-            if got != size {
-                return Err(io::Error::other(format!(
-                    "expected {size} bytes, received {got}"
-                )));
-            }
-            crate::fsutil::apply_mtime(&tmp, mtime, "storing");
-            fs::rename(&tmp, local_dst).ctx(|| {
-                format!(
-                    "moving {} into place at {}",
-                    tmp.display(),
-                    local_dst.display()
-                )
-            })?;
-            let _ = sync_dir(parent);
-            Ok(expected)
-        })();
-        if outcome.is_err() {
+        let tmp = crate::side::temp_for(local_dst);
+        let mut offset = 0u64;
+        if resume {
+            offset = fs::metadata(&tmp).map(|meta| meta.len()).unwrap_or(0);
+        } else {
             let _ = fs::remove_file(&tmp);
         }
-        outcome
+
+        // A file that shrank on the other side cannot be continued: the
+        // partial file is dropped and the transfer starts over.
+        let mut restarted = false;
+        loop {
+            match self.fetch(path, offset, &tmp, local_dst, parent, resume) {
+                Ok(hash) => return Ok(hash),
+                Err(error) => {
+                    let restart = !restarted && error.to_string().contains(proto::RESUME_TOO_LONG);
+                    if !restart {
+                        return Err(error);
+                    }
+                    restarted = true;
+                    let _ = fs::remove_file(&tmp);
+                    offset = 0;
+                }
+            }
+        }
     }
 
+    /// Ask for the bytes from `offset` on and put the file in place.
     fn remove(&mut self, path: &Path) -> io::Result<()> {
         self.request(&Frame::Delete(path.to_path_buf())).map(|_| ())
     }

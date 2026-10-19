@@ -25,7 +25,9 @@ enum Command {
     Push(PairArgs),
     /// One-way: copy the other side into the local directory
     Pull(PairArgs),
-    /// Compare by content and report differences; writes nothing
+    /// Compare by content and report differences; writes nothing.
+    /// Exits 0 when the two sides agree and 3 when they differ — unlike
+    /// --dry-run, which always exits 0.
     Verify(PairArgs),
     /// Show this machine's fingerprint, creating its key on first use
     Id,
@@ -95,6 +97,15 @@ struct PairArgs {
     excludes: Vec<String>,
     #[arg(long, value_name = "DIR")]
     archive_dir: Option<PathBuf>,
+    /// Keep the version that is about to be replaced or removed in DIR
+    #[arg(long, value_name = "DIR")]
+    backup: Option<PathBuf>,
+    /// Report as one JSON object per line instead of in prose
+    #[arg(long)]
+    json: bool,
+    /// Keep an interrupted transfer and continue it on the next run
+    #[arg(long)]
+    partial: bool,
     /// Certificate fingerprint the server must present (needed the first time you
     /// talk to a host; it is remembered afterwards)
     #[arg(long, value_name = "HEX")]
@@ -198,6 +209,9 @@ fn main() -> ExitCode {
         fast: args.fast,
         default_ignores: !args.no_default_ignores,
         excludes: args.excludes,
+        json: args.json,
+        partial: args.partial,
+        tty: io::stderr().is_terminal(),
         verbose: args.verbose > 0,
         quiet: args.quiet,
         ..Default::default()
@@ -205,6 +219,7 @@ fn main() -> ExitCode {
     if let Some(dir) = args.archive_dir {
         options.archive_dir = dir;
     }
+    options.backup_dir = args.backup.clone();
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -233,7 +248,9 @@ fn main() -> ExitCode {
             Ok(true) => {
                 options.auto = true;
                 match run_target(&local_root, &target, pin.as_deref(), &options, &mut out) {
-                    Ok(summary) => return exit_for(&summary, is_verify),
+                    Ok(summary) => {
+                        return exit_for(&summary, is_verify, options.dry_run, options.json)
+                    }
                     Err(error) => {
                         eprintln!("error: {error}");
                         return ExitCode::from(1);
@@ -241,7 +258,11 @@ fn main() -> ExitCode {
                 }
             }
             Ok(false) => {
-                println!("nothing done");
+                if options.json {
+                    eprintln!("nothing done");
+                } else {
+                    println!("nothing done");
+                }
                 return ExitCode::from(0);
             }
             Err(error) => {
@@ -251,7 +272,7 @@ fn main() -> ExitCode {
         }
     }
 
-    exit_for(&summary, is_verify)
+    exit_for(&summary, is_verify, options.dry_run, options.json)
 }
 
 fn run_target(
@@ -317,6 +338,7 @@ fn authorize(fingerprint: &str) -> ExitCode {
             for entry in list {
                 println!("  {entry}");
             }
+            println!("takes effect on the next connection; the server needs no restart");
             ExitCode::from(0)
         }
         Err(error) => {
@@ -339,19 +361,24 @@ fn serve(args: &ServeArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let allowed = match tls::read_list(&tls::authorized_path(&data_dir)) {
+    let list_path = tls::authorized_path(&data_dir);
+    let allowed = match tls::read_list(&list_path) {
         Ok(list) => list,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::from(1);
         }
     };
+    // The list is shared with the certificate verifier and read back from disk
+    // before every connection, so `twin authorize` takes effect right away.
+    let allowed = tls::allow_list(allowed);
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match tls::serve_forever(
         &args.root,
         &identity,
         &allowed,
+        &list_path,
         &args.listen,
         args.once,
         &mut out,
@@ -404,15 +431,26 @@ fn doctor(args: &DoctorArgs) -> ExitCode {
     }
 }
 
-fn exit_for(summary: &twin::Summary, is_verify: bool) -> ExitCode {
+fn exit_for(summary: &twin::Summary, is_verify: bool, dry_run: bool, json: bool) -> ExitCode {
     if is_verify {
+        // `twin verify` keeps its own contract: 0 when the two sides agree, 3
+        // when they differ. A dry run of the other verbs exits 0 instead.
         let differences = summary.created + summary.updated + summary.deleted + summary.conflicts;
         if differences > 0 {
-            println!("{differences} paths differ");
+            if !json {
+                println!("{differences} paths differ");
+            }
             return ExitCode::from(3);
         }
-        println!("in sync");
+        if !json {
+            println!("in sync");
+        }
         return ExitCode::from(0);
+    }
+    if dry_run {
+        // A dry run is a report, not a decision: it succeeds even when the
+        // plan holds conflicts. Files that failed are still failures.
+        return ExitCode::from(if summary.failures > 0 { 4 } else { 0 });
     }
     ExitCode::from(summary.exit_code().code() as u8)
 }

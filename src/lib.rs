@@ -1,12 +1,15 @@
 pub mod archive;
+pub mod backup;
 pub mod classify;
 pub mod doctor;
 pub mod engine;
 pub mod fsutil;
+pub mod json;
 pub mod log;
 pub mod model;
 pub mod proto;
 pub mod remote;
+pub mod report;
 pub mod scan;
 pub mod side;
 pub mod tls;

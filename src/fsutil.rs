@@ -1,14 +1,81 @@
 use crate::model::Hash;
 use filetime::FileTime;
-use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const BUF: usize = 1 << 20;
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The name of the temporary file that holds a transfer in flight, derived from
+/// the destination it will be renamed to.
+///
+/// The name has to be stable across runs: an interrupted transfer leaves this
+/// file behind, and the next run must find it to continue where the last one
+/// stopped. A digest of the whole destination path keeps two trees that happen
+/// to share a file name apart, and the escaped file name keeps it readable.
+pub fn temp_file_name(dst: &Path) -> String {
+    let mut escaped = String::new();
+    for byte in dst.file_name().unwrap_or_default().as_bytes() {
+        let c = *byte;
+        if c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-' {
+            escaped.push(c as char);
+        } else {
+            escaped.push('_');
+            escaped.push_str(&format!("{c:02x}"));
+        }
+        if escaped.len() >= 96 {
+            break;
+        }
+    }
+    let digest = blake3::hash(dst.as_os_str().as_bytes());
+    format!(".twin-tmp-{escaped}-{}", &digest.to_hex().to_string()[..8])
+}
+
+/// A hash that did not match. The engine retries such a transfer once before
+/// it gives up on the file.
+#[derive(Debug)]
+pub struct VerifyError(pub String);
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for VerifyError {}
+
+/// An error that means "the bytes did not verify", as opposed to "the disk
+/// said no". Only the former is worth retrying.
+pub fn verification_error(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, VerifyError(message.into()))
+}
+
+/// Whether an error is a verification failure.
+pub fn is_verification_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<VerifyError>())
+        .is_some()
+}
+
+/// Do a transfer, and do it once more if the content did not verify.
+///
+/// A hash that does not match is worth another try: the file may have been
+/// read while it was being written. Anything else is the disk saying no, and
+/// saying no twice is the answer.
+pub fn retry_once<T>(what: &str, mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    match attempt() {
+        Ok(value) => Ok(value),
+        Err(error) if is_verification_error(&error) => {
+            crate::warn!("{what}: the content did not verify; trying once more");
+            attempt()
+        }
+        Err(error) => Err(error),
+    }
+}
 
 pub fn hash_file(path: &Path) -> io::Result<Hash> {
     let file = File::open(path)?;
@@ -28,22 +95,94 @@ pub fn hash_file(path: &Path) -> io::Result<Hash> {
 /// Copy `src` to `dst` so that `dst` is never observable in a partial state:
 /// write a temp file in the destination directory, fsync it, verify its hash
 /// against the bytes actually read from the source, then rename.
-pub fn copy_atomic(src: &Path, dst: &Path) -> io::Result<Hash> {
+pub fn copy_atomic(src: &Path, dst: &Path, tmp: &Path) -> io::Result<Hash> {
     let parent = dst
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
     fs::create_dir_all(parent).ctx(|| format!("creating {}", parent.display()))?;
-    let tmp = parent.join(format!(
-        ".twin-tmp-{}-{}",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    // A temporary file left by an earlier run must never stand in the way,
+    // not even one that cannot be written to.
+    let _ = fs::remove_file(tmp);
 
-    let outcome = copy_via_temp(src, &tmp, dst, parent);
+    let outcome = copy_via_temp(src, tmp, dst, parent);
     if outcome.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(tmp);
     }
     outcome
+}
+
+/// Copy `src` to `dst`, continuing from `tmp` when that file already holds the
+/// beginning of the source.
+///
+/// The whole file is verified once it is complete, prefix included: a prefix
+/// that does not belong to this source fails the check and the temporary file
+/// is thrown away, so the next attempt starts from zero.
+pub fn copy_resumable(src: &Path, dst: &Path, tmp: &Path) -> io::Result<Hash> {
+    let parent = dst
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
+    fs::create_dir_all(parent).ctx(|| format!("creating {}", parent.display()))?;
+
+    let size = fs::metadata(src)
+        .ctx(|| format!("stat {}", src.display()))?
+        .len();
+    let expected = hash_file(src).ctx(|| format!("hashing {}", src.display()))?;
+
+    // A partial file longer than the source belongs to an older, longer
+    // version: it cannot be continued, so it goes.
+    let mut offset = 0u64;
+    match fs::metadata(tmp) {
+        Ok(meta) if meta.len() <= size => offset = meta.len(),
+        Ok(_) => {
+            let _ = fs::remove_file(tmp);
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    if offset < size {
+        let mut reader = BufReader::with_capacity(
+            BUF,
+            File::open(src).ctx(|| format!("opening {}", src.display()))?,
+        );
+        reader
+            .seek(SeekFrom::Start(offset))
+            .ctx(|| format!("seeking in {}", src.display()))?;
+        let mut writer = BufWriter::with_capacity(
+            BUF,
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(tmp)
+                .ctx(|| format!("opening {}", tmp.display()))?,
+        );
+        let mut buf = vec![0u8; BUF];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n])?;
+        }
+        writer.flush()?;
+        fsync_hard(writer.get_ref())?;
+    }
+
+    // Verify what landed on disk rather than trusting the write path.
+    let got = hash_file(tmp).ctx(|| format!("hashing {}", tmp.display()))?;
+    if got != expected {
+        let _ = fs::remove_file(tmp);
+        return Err(verification_error(
+            "verification failed: bytes on disk differ from bytes read",
+        ));
+    }
+
+    let meta = fs::metadata(src).ctx(|| format!("stat {}", src.display()))?;
+    apply_mtime(tmp, mtime_ns(&meta), "copying");
+    fs::rename(tmp, dst)
+        .ctx(|| format!("moving {} into place at {}", tmp.display(), dst.display()))?;
+    let _ = sync_dir(parent);
+    Ok(expected)
 }
 
 fn copy_via_temp(src: &Path, tmp: &Path, dst: &Path, parent: &Path) -> io::Result<Hash> {
@@ -72,7 +211,7 @@ fn copy_via_temp(src: &Path, tmp: &Path, dst: &Path, parent: &Path) -> io::Resul
 
     // Verify what landed on disk rather than trusting the write path.
     if hash_file(tmp)? != source_hash {
-        return Err(io::Error::other(
+        return Err(verification_error(
             "verification failed: bytes on disk differ from bytes read",
         ));
     }
@@ -323,7 +462,8 @@ mod tests {
         let dst = dir.path().join("nested/dst.txt");
         fs::write(&src, b"hello twin").unwrap();
 
-        let hash = copy_atomic(&src, &dst).unwrap();
+        let tmp = dst.parent().unwrap().join(temp_file_name(&dst));
+        let hash = copy_atomic(&src, &dst, &tmp).unwrap();
         assert_eq!(fs::read(&dst).unwrap(), b"hello twin");
         assert_eq!(hash, *blake3::hash(b"hello twin").as_bytes());
         let src_m = fs::metadata(&src).unwrap();
@@ -339,6 +479,83 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn a_verification_failure_is_tried_once_more_and_nothing_else_is() {
+        let mut tries = 0;
+        let outcome: io::Result<()> = retry_once("test", || {
+            tries += 1;
+            Err(verification_error("the bytes do not match"))
+        });
+        assert!(outcome.is_err());
+        assert_eq!(tries, 2, "one more try, and no more");
+
+        let mut tries = 0;
+        let outcome: io::Result<()> = retry_once("test", || {
+            tries += 1;
+            Err(io::Error::other("the disk said no"))
+        });
+        assert!(outcome.is_err());
+        assert_eq!(tries, 1, "a plain failure is not worth a second try");
+
+        let mut tries = 0;
+        let outcome: io::Result<()> = retry_once("test", || {
+            tries += 1;
+            if tries == 1 {
+                Err(verification_error("the bytes do not match"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(outcome.is_ok(), "the second try succeeded");
+        assert_eq!(tries, 2);
+    }
+
+    #[test]
+    fn a_temp_name_is_stable_and_never_collides_with_a_plain_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("sub/doc.txt");
+        let first = temp_file_name(&dst);
+        let second = temp_file_name(&dst);
+        assert_eq!(first, second, "the name must survive a run");
+        assert!(first.starts_with(".twin-tmp-"), "{first}");
+        assert_ne!(
+            first,
+            temp_file_name(&dir.path().join("sub/other.txt")),
+            "two destinations must not share a temp file"
+        );
+        // Awkward bytes stay inside one file name.
+        let odd = temp_file_name(&dir.path().join("we ird\"name.txt"));
+        assert!(!odd.contains('/'), "{odd}");
+        assert!(odd.len() < 200, "{odd}");
+    }
+
+    #[test]
+    fn a_resumed_copy_completes_the_file_and_a_bad_prefix_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("out/dst.bin");
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &payload).unwrap();
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let tmp = dst.parent().unwrap().join(temp_file_name(&dst));
+
+        // An interrupted run left the first half behind.
+        fs::write(&tmp, &payload[..1000]).unwrap();
+        let hash = copy_resumable(&src, &dst, &tmp).unwrap();
+        assert_eq!(hash, *blake3::hash(&payload).as_bytes());
+        assert_eq!(fs::read(&dst).unwrap(), payload);
+        assert!(!tmp.exists(), "the temp file must be gone");
+
+        // A prefix that belongs to something else must not be trusted.
+        let dst2 = dir.path().join("out/dst2.bin");
+        let tmp2 = dst2.parent().unwrap().join(temp_file_name(&dst2));
+        fs::write(&tmp2, b"not the beginning of this file").unwrap();
+        let error = copy_resumable(&src, &dst2, &tmp2).unwrap_err();
+        assert!(is_verification_error(&error), "{error}");
+        assert!(!tmp2.exists(), "a bad prefix must be thrown away");
+        assert!(!dst2.exists(), "nothing may be published");
     }
 
     #[test]

@@ -305,9 +305,15 @@ pub fn remote(remote: &RemoteOptions, pin: &str) -> Vec<Check> {
     // Walking proves the far end can actually read the directory it serves.
     let mut count = 0u64;
     let mut walk_error: Option<io::Error> = None;
+    let mut unreadable: Vec<String> = Vec::new();
     loop {
         match backend.walk() {
-            Ok(Some(_)) => count += 1,
+            Ok(Some(Ok(_))) => count += 1,
+            // A path that cannot be read is a problem of its own: the rest of
+            // the listing is still worth counting.
+            Ok(Some(Err(failure))) => {
+                unreadable.push(format!("{}: {}", failure.path.display(), failure.message))
+            }
             Ok(None) => break,
             Err(error) => {
                 walk_error = Some(error);
@@ -316,9 +322,17 @@ pub fn remote(remote: &RemoteOptions, pin: &str) -> Vec<Check> {
         }
     }
     match walk_error {
-        None => checks.push(Check::pass(
+        None if unreadable.is_empty() => checks.push(Check::pass(
             "remote listing",
             format!("{count} entries readable"),
+        )),
+        None => checks.push(Check::fail(
+            "remote listing",
+            format!(
+                "{count} entries readable, {} unreadable: {}",
+                unreadable.len(),
+                unreadable.join("; ")
+            ),
         )),
         Some(error) => checks.push(Check::fail("remote listing", error.to_string())),
     }

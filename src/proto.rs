@@ -7,11 +7,11 @@ use crate::model::{Entry, Hash, Kind};
 use crate::scan::{entry_for, IgnoreRules, Scanner};
 use crate::side::safe_join;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const AGENT: &str = concat!("twin ", env!("CARGO_PKG_VERSION"));
 const CHUNK: usize = 256 * 1024;
 const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -32,10 +32,24 @@ const STAT: u8 = 13;
 const STAT_REPLY: u8 = 14;
 const CHUNK_FRAME: u8 = 15;
 const END_FRAME: u8 = 16;
+/// A GET that starts at a byte offset, so an interrupted transfer can be
+/// continued instead of started over.
+const GET_RANGE: u8 = 17;
+/// A PUSH that continues a partial transfer at a byte offset.
+const PUSH_RANGE: u8 = 18;
+/// A question about how much of a file the far end already holds.
+const RESUME_QUERY: u8 = 19;
+/// The answer to a resume query.
+const RESUME_REPLY: u8 = 20;
 
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERROR: u8 = 1;
 pub const STATUS_MISSING: u8 = 2;
+
+/// What the far end says when the file it holds is shorter than the offset a
+/// resume asked for: the prefix cannot belong to it, so the transfer has to
+/// start over.
+pub const RESUME_TOO_LONG: &str = "the file is shorter than the resume offset";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -52,6 +66,11 @@ pub enum Frame {
     EndList,
     Hash(PathBuf),
     Get(PathBuf),
+    /// A GET that starts at `offset` bytes into the file.
+    GetRange {
+        path: PathBuf,
+        offset: u64,
+    },
     DataBegin {
         size: u64,
         mtime_ns: i64,
@@ -62,6 +81,21 @@ pub enum Frame {
         size: u64,
         mtime_ns: i64,
         hash: Hash,
+    },
+    /// A PUSH that continues the file at `offset` bytes and carries the hash
+    /// of the whole file, prefix included.
+    PushRange {
+        path: PathBuf,
+        size: u64,
+        mtime_ns: i64,
+        hash: Hash,
+        offset: u64,
+    },
+    /// How much of the file the far end already holds, so a transfer can be
+    /// continued where it stopped.
+    ResumeQuery(PathBuf),
+    ResumeReply {
+        size: u64,
     },
     Chunk(Vec<u8>),
     End,
@@ -108,6 +142,11 @@ pub fn write_frame<W: Write + ?Sized>(out: &mut W, frame: &Frame) -> io::Result<
             payload.push(GET);
             payload.extend_from_slice(path.as_os_str().as_bytes());
         }
+        Frame::GetRange { path, offset } => {
+            payload.push(GET_RANGE);
+            payload.extend_from_slice(&offset.to_le_bytes());
+            payload.extend_from_slice(path.as_os_str().as_bytes());
+        }
         Frame::DataBegin {
             size,
             mtime_ns,
@@ -129,6 +168,28 @@ pub fn write_frame<W: Write + ?Sized>(out: &mut W, frame: &Frame) -> io::Result<
             payload.extend_from_slice(&mtime_ns.to_le_bytes());
             payload.extend_from_slice(hash);
             payload.extend_from_slice(path.as_os_str().as_bytes());
+        }
+        Frame::PushRange {
+            path,
+            size,
+            mtime_ns,
+            hash,
+            offset,
+        } => {
+            payload.push(PUSH_RANGE);
+            payload.extend_from_slice(&size.to_le_bytes());
+            payload.extend_from_slice(&mtime_ns.to_le_bytes());
+            payload.extend_from_slice(&offset.to_le_bytes());
+            payload.extend_from_slice(hash);
+            payload.extend_from_slice(path.as_os_str().as_bytes());
+        }
+        Frame::ResumeQuery(path) => {
+            payload.push(RESUME_QUERY);
+            payload.extend_from_slice(path.as_os_str().as_bytes());
+        }
+        Frame::ResumeReply { size } => {
+            payload.push(RESUME_REPLY);
+            payload.extend_from_slice(&size.to_le_bytes());
         }
         Frame::Chunk(bytes) => {
             payload.push(CHUNK_FRAME);
@@ -252,6 +313,16 @@ fn decode(payload: &[u8]) -> io::Result<Frame> {
         END_LIST => Ok(Frame::EndList),
         HASH => Ok(Frame::Hash(path_from(body))),
         GET => Ok(Frame::Get(path_from(body))),
+        GET_RANGE => {
+            if body.len() < 8 {
+                return Err(bad("get range"));
+            }
+            let offset = u64::from_le_bytes(body[0..8].try_into().unwrap());
+            Ok(Frame::GetRange {
+                path: path_from(&body[8..]),
+                offset,
+            })
+        }
         DATA_BEGIN => {
             if body.len() < 48 {
                 return Err(bad("data"));
@@ -280,6 +351,33 @@ fn decode(payload: &[u8]) -> io::Result<Frame> {
                 size,
                 mtime_ns,
                 hash,
+            })
+        }
+        PUSH_RANGE => {
+            if body.len() < 56 {
+                return Err(bad("push range"));
+            }
+            let size = u64::from_le_bytes(body[0..8].try_into().unwrap());
+            let mtime_ns = i64::from_le_bytes(body[8..16].try_into().unwrap());
+            let offset = u64::from_le_bytes(body[16..24].try_into().unwrap());
+            let mut hash: Hash = [0u8; 32];
+            hash.copy_from_slice(&body[24..56]);
+            let path = path_from(&body[56..]);
+            Ok(Frame::PushRange {
+                path,
+                size,
+                mtime_ns,
+                hash,
+                offset,
+            })
+        }
+        RESUME_QUERY => Ok(Frame::ResumeQuery(path_from(body))),
+        RESUME_REPLY => {
+            if body.len() < 8 {
+                return Err(bad("resume reply"));
+            }
+            Ok(Frame::ResumeReply {
+                size: u64::from_le_bytes(body[0..8].try_into().unwrap()),
             })
         }
         CHUNK_FRAME => Ok(Frame::Chunk(body.to_vec())),
@@ -449,7 +547,14 @@ pub fn serve(root: &Path, input: &mut dyn Read, output: &mut dyn Write) -> io::R
                 crate::debug!("listing {}", root.display());
                 let mut scanner = Scanner::new(root, rules.clone())?;
                 while let Some(entry) = scanner.next_entry() {
-                    write_frame(output, &Frame::Entry(entry?))?;
+                    match entry {
+                        Ok(entry) => write_frame(output, &Frame::Entry(entry))?,
+                        // One path that cannot be read must not hide the rest
+                        // of the tree.
+                        Err(failure) => {
+                            crate::warn!("{}: {}", failure.path.display(), failure.message);
+                        }
+                    }
                 }
                 write_frame(output, &Frame::EndList)?;
                 output.flush()?;
@@ -478,40 +583,21 @@ pub fn serve(root: &Path, input: &mut dyn Read, output: &mut dyn Write) -> io::R
                 write_frame(output, &Frame::StatReply(reply))?;
                 output.flush()?;
             }
-            Frame::Get(path) => {
-                crate::debug!("sending {}", path.display());
-                let abs = match safe_join(root, &path) {
-                    Ok(abs) => abs,
+            Frame::Get(path) => send_file(output, root, &path, 0)?,
+            Frame::GetRange { path, offset } => send_file(output, root, &path, offset)?,
+            Frame::ResumeQuery(path) => {
+                let reply = match safe_join(root, &path) {
+                    Ok(abs) => {
+                        let tmp = crate::side::temp_for(&abs);
+                        fs::metadata(&tmp).map(|meta| meta.len()).unwrap_or(0)
+                    }
                     Err(e) => {
                         ack(output, STATUS_ERROR, banner, &e.to_string())?;
                         continue;
                     }
                 };
-                let meta = match fs::symlink_metadata(&abs) {
-                    Ok(meta) if meta.is_file() => meta,
-                    Ok(_) => {
-                        ack(output, STATUS_ERROR, banner, "not a regular file")?;
-                        continue;
-                    }
-                    Err(e) => {
-                        ack(output, STATUS_MISSING, banner, &e.to_string())?;
-                        continue;
-                    }
-                };
-                let hash = hash_file(&abs).ctx(|| format!("hashing {}", abs.display()))?;
-                write_frame(
-                    output,
-                    &Frame::DataBegin {
-                        size: meta.len(),
-                        mtime_ns: mtime_ns(&meta),
-                        hash,
-                    },
-                )?;
-                let mut reader = BufReader::with_capacity(
-                    CHUNK,
-                    File::open(&abs).ctx(|| format!("opening {}", abs.display()))?,
-                );
-                write_stream(&mut reader, output).ctx(|| format!("sending {}", abs.display()))?;
+                write_frame(output, &Frame::ResumeReply { size: reply })?;
+                output.flush()?;
             }
             Frame::Push {
                 path,
@@ -528,10 +614,43 @@ pub fn serve(root: &Path, input: &mut dyn Read, output: &mut dyn Write) -> io::R
                         continue;
                     }
                 };
-                let outcome = receive_file(input, &abs, size, mtime, hash);
+                let tmp = crate::side::temp_for(&abs);
+                let outcome = receive_file(input, &abs, &tmp, size, mtime, hash, 0, false);
                 match outcome {
                     Ok(()) => ack(output, STATUS_OK, hash, "")?,
                     Err(e) => {
+                        // Without a resume the partial file is of no use to anyone.
+                        let _ = fs::remove_file(&tmp);
+                        ack(output, STATUS_ERROR, banner, &e.to_string())?;
+                        continue;
+                    }
+                }
+            }
+            Frame::PushRange {
+                path,
+                size,
+                mtime_ns: mtime,
+                hash,
+                offset,
+            } => {
+                let abs = match safe_join(root, &path) {
+                    Ok(abs) => abs,
+                    Err(e) => {
+                        drain_stream(input)?;
+                        ack(output, STATUS_ERROR, banner, &e.to_string())?;
+                        continue;
+                    }
+                };
+                let tmp = crate::side::temp_for(&abs);
+                let outcome = receive_file(input, &abs, &tmp, size, mtime, hash, offset, true);
+                match outcome {
+                    Ok(()) => ack(output, STATUS_OK, hash, "")?,
+                    Err(e) => {
+                        // A partial transfer is kept so the next run can continue
+                        // it; a file that does not verify is thrown away.
+                        if is_hash_mismatch(&e.to_string()) {
+                            let _ = fs::remove_file(&tmp);
+                        }
                         ack(output, STATUS_ERROR, banner, &e.to_string())?;
                         continue;
                     }
@@ -582,59 +701,147 @@ fn drain_stream(input: &mut dyn Read) -> io::Result<()> {
     }
 }
 
+/// Send a file, optionally starting at an offset so an interrupted transfer
+/// can be continued. The announced hash always covers the whole file, so the
+/// receiving side can verify the result in one go.
+fn send_file(output: &mut dyn Write, root: &Path, path: &Path, offset: u64) -> io::Result<()> {
+    let banner = *blake3::hash(b"twin").as_bytes();
+    crate::debug!("sending {}", path.display());
+    let abs = match safe_join(root, path) {
+        Ok(abs) => abs,
+        Err(e) => {
+            ack(output, STATUS_ERROR, banner, &e.to_string())?;
+            return Ok(());
+        }
+    };
+    let meta = match fs::symlink_metadata(&abs) {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => {
+            ack(output, STATUS_ERROR, banner, "not a regular file")?;
+            return Ok(());
+        }
+        Err(e) => {
+            ack(output, STATUS_MISSING, banner, &e.to_string())?;
+            return Ok(());
+        }
+    };
+    if offset > meta.len() {
+        // The file shrank since the last attempt: the prefix cannot be part
+        // of it, so the client has to start over.
+        ack(output, STATUS_ERROR, banner, RESUME_TOO_LONG)?;
+        return Ok(());
+    }
+    let hash = hash_file(&abs).ctx(|| format!("hashing {}", abs.display()))?;
+    write_frame(
+        output,
+        &Frame::DataBegin {
+            size: meta.len(),
+            mtime_ns: mtime_ns(&meta),
+            hash,
+        },
+    )?;
+    let mut reader = BufReader::with_capacity(
+        CHUNK,
+        File::open(&abs).ctx(|| format!("opening {}", abs.display()))?,
+    );
+    if offset > 0 {
+        reader
+            .seek(SeekFrom::Start(offset))
+            .ctx(|| format!("seeking in {}", abs.display()))?;
+    }
+    write_stream(&mut reader, output).ctx(|| format!("sending {}", abs.display()))?;
+    Ok(())
+}
+
+/// Whether a message from the far side describes a hash mismatch, which the
+/// engine may retry once.
+pub fn is_hash_mismatch(message: &str) -> bool {
+    message.contains("hash does not match")
+        || message.contains("verification failed")
+        || message.contains("does not match the hash")
+}
+
+/// Receive a file into `tmp` and move it into place.
+///
+/// With `offset` above zero the transfer continues a partial file: the bytes
+/// already there are kept and the whole file is verified once it is complete.
+/// A file that does not verify is thrown away, so the next attempt starts
+/// from zero.
+#[allow(clippy::too_many_arguments)]
 fn receive_file(
     input: &mut dyn Read,
     abs: &Path,
+    tmp: &Path,
     declared_size: u64,
     mtime: i64,
     expected: Hash,
+    offset: u64,
+    resumable: bool,
 ) -> io::Result<()> {
     let parent = abs
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no parent directory"))?;
     fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".twin-tmp-{}-{}",
-        std::process::id(),
-        abs.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default()
-    ));
+
+    if resumable {
+        let have = fs::metadata(tmp).map(|meta| meta.len()).unwrap_or(0);
+        if have < offset {
+            return Err(io::Error::other(
+                "the partial file is shorter than the resume offset",
+            ));
+        }
+        // Anything past the agreed offset belongs to an older attempt.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(tmp)
+            .ctx(|| format!("opening {}", tmp.display()))?;
+        file.set_len(offset)
+            .ctx(|| format!("trimming {}", tmp.display()))?;
+    } else {
+        let _ = fs::remove_file(tmp);
+    }
+
+    let mut writer = BufWriter::with_capacity(
+        CHUNK,
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(tmp)
+            .ctx(|| format!("creating {}", tmp.display()))?,
+    );
     let result = (|| -> io::Result<()> {
-        let mut writer = BufWriter::with_capacity(
-            CHUNK,
-            File::create(&tmp).ctx(|| format!("creating {}", tmp.display()))?,
-        );
-        let got = read_stream(input, &mut writer)
+        read_stream(input, &mut writer)
             .ctx(|| format!("receiving {} into {}", abs.display(), tmp.display()))?;
         writer.flush()?;
         crate::fsutil::fsync_hard(writer.get_ref())
             .ctx(|| format!("flushing {}", tmp.display()))?;
         drop(writer);
+        // The whole file is verified, prefix included.
+        let got = hash_file(tmp).ctx(|| format!("hashing {}", tmp.display()))?;
         if got != expected {
-            return Err(io::Error::other(
+            return Err(crate::fsutil::verification_error(
                 "content hash does not match what was sent",
             ));
         }
-        let written = fs::metadata(&tmp)?.len();
+        let written = fs::metadata(tmp)?.len();
         if written != declared_size {
             return Err(io::Error::other(format!(
                 "expected {declared_size} bytes, wrote {written}"
             )));
         }
-        crate::fsutil::apply_mtime(&tmp, mtime, "storing");
+        crate::fsutil::apply_mtime(tmp, mtime, "storing");
         if let Ok(existing) = fs::symlink_metadata(abs) {
             if existing.is_dir() {
                 return Err(io::Error::other("destination is a directory"));
             }
         }
-        fs::rename(&tmp, abs)
+        fs::rename(tmp, abs)
             .ctx(|| format!("moving {} into place at {}", tmp.display(), abs.display()))?;
         let _ = sync_dir(parent);
         Ok(())
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    if result.is_err() && !resumable {
+        let _ = fs::remove_file(tmp);
     }
     result
 }
@@ -685,6 +892,19 @@ mod tests {
             mtime_ns: 1,
         })));
         frames_round_trip(Frame::Delete(PathBuf::from("gone")));
+        frames_round_trip(Frame::GetRange {
+            path: PathBuf::from("a/b.bin"),
+            offset: 4096,
+        });
+        frames_round_trip(Frame::PushRange {
+            path: PathBuf::from("a/b.bin"),
+            size: 9000,
+            mtime_ns: 11,
+            hash: [7u8; 32],
+            offset: 4096,
+        });
+        frames_round_trip(Frame::ResumeQuery(PathBuf::from("a/b.bin")));
+        frames_round_trip(Frame::ResumeReply { size: 4096 });
         frames_round_trip(Frame::Bye);
     }
 

@@ -99,6 +99,14 @@ impl BaseRow {
     }
 }
 
+/// A failure that belongs to exactly one path. The run reports it, counts it
+/// and carries on with the other paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathFailure {
+    pub path: PathBuf,
+    pub message: String,
+}
+
 /// One unit of planned work. A run reports exactly these, dry or real.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -141,6 +149,36 @@ pub enum Action {
 }
 
 impl Action {
+    /// The path this action is about.
+    pub fn path(&self) -> &Path {
+        match self {
+            Action::Copy { path, .. }
+            | Action::Delete { path, .. }
+            | Action::Conflict { path, .. }
+            | Action::Adopt { path, .. }
+            | Action::Resurrect { path, .. }
+            | Action::Forget { path, .. }
+            | Action::Skip { path, .. } => path,
+        }
+    }
+
+    /// The word the report uses for this action. The same words the text
+    /// output uses, so both reports can be read side by side.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Action::Copy { new_file: true, .. } => "create",
+            Action::Copy {
+                new_file: false, ..
+            } => "update",
+            Action::Delete { .. } => "delete",
+            Action::Conflict { .. } => "conflict",
+            Action::Skip { .. } => "skip",
+            Action::Resurrect { .. } => "resurrect",
+            Action::Forget { .. } => "forget",
+            Action::Adopt { .. } => "adopt",
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             Action::Copy {
