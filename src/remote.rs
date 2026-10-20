@@ -17,9 +17,29 @@ use std::sync::Arc;
 
 static SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the far end turned us away.
+///
+/// TLS 1.3 lets the client finish its handshake before the server has looked
+/// at the client certificate, so a refusal arrives *after* the handshake: the
+/// server sends its alert and closes the connection, and the client finds a
+/// closed connection when it writes the first frame. Whether that surfaces as
+/// the alert itself or as a broken pipe depends on the platform and on the
+/// timing, so both are read as the refusal they are.
+fn is_refusal(error: &io::Error) -> bool {
+    match error.kind() {
+        io::ErrorKind::BrokenPipe
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::UnexpectedEof => return true,
+        _ => {}
+    }
+    let text = error.to_string();
+    text.contains("alert") || text.contains("certificate")
+}
+
 fn handshake_error(label: &str, error: io::Error) -> io::Error {
     let text = error.to_string();
-    let hint = if text.contains("alert") || text.contains("certificate") {
+    let hint = if is_refusal(&error) {
         "this client is not allowed there: run `twin id` here, then `twin authorize <fingerprint>` \
          on the server — it takes effect on the next connection"
     } else {
@@ -434,5 +454,57 @@ impl Backend for RemoteBackend {
         let _ = self.send(&Frame::Bye);
         let _ = self.stream.flush();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_refusal;
+    use std::io;
+
+    /// A server that refuses the client certificate closes the connection
+    /// instead of answering. Depending on the platform and the timing that
+    /// arrives as a broken pipe, as a reset, as an unexpected end of file, or
+    /// as the TLS alert itself — and all four mean the same thing.
+    #[test]
+    fn a_closed_connection_during_the_handshake_is_a_refusal() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            let error = io::Error::from(kind);
+            assert!(is_refusal(&error), "{kind:?} must read as a refusal");
+        }
+        let alert = io::Error::other("received fatal alert: certificate required");
+        assert!(is_refusal(&alert), "a TLS alert must read as a refusal");
+    }
+
+    /// Anything else is not a refusal: the other side may simply not speak the
+    /// twin protocol.
+    #[test]
+    fn other_failures_are_not_refusals() {
+        let error = io::Error::new(io::ErrorKind::InvalidData, "not a twin frame");
+        assert!(!is_refusal(&error));
+        let error = io::Error::new(io::ErrorKind::TimedOut, "timed out");
+        assert!(!is_refusal(&error));
+    }
+
+    /// On Linux a refused client finds a broken pipe where on macOS it finds
+    /// the alert. Both have to say the same thing, because both mean the same
+    /// thing.
+    #[test]
+    fn a_refusal_always_says_how_to_fix_it() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            let message =
+                super::handshake_error("127.0.0.1:1234", io::Error::from(kind)).to_string();
+            assert!(message.contains("authorize"), "{message}");
+            assert!(message.contains("not allowed"), "{message}");
+        }
     }
 }

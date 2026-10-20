@@ -405,8 +405,8 @@ fn a_blocked_local_network_check_names_the_ways_out() {
     );
 }
 
-/// The build step and the detector have to agree: a freshly linked binary reads as
-/// unsigned, the script signs it, and then it reads as signed.
+/// The build step and the detector have to agree: an unsigned binary is signed
+/// by the script, and then it reads as signed.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_signing_script_turns_an_unsigned_binary_into_a_signed_one() {
@@ -416,10 +416,18 @@ fn the_signing_script_turns_an_unsigned_binary_into_a_signed_one() {
     let copy = place._root.path().join("copy-of-the-test-binary");
     fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
 
+    // The linker signs what it links on arm64, so the copy may already carry a
+    // signature there. Take it off: what this test is about is that the script
+    // and the detector agree, not what the linker happens to do.
+    let _ = Command::new("/usr/bin/codesign")
+        .arg("--remove-signature")
+        .arg(&copy)
+        .output();
+
     assert_eq!(
         twin::tls::signature_state(&copy),
         twin::tls::SignatureState::Unsigned,
-        "a binary cargo just linked carries no signature"
+        "the copy must be unsigned before the script runs"
     );
 
     let script = StdPath::new(env!("CARGO_MANIFEST_DIR")).join("scripts/codesign-macos.sh");

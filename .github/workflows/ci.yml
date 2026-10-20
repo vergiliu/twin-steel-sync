@@ -75,15 +75,17 @@ jobs:
       - name: Build the binary
         run: cargo build
 
+      - name: Run the test suite
+        run: cargo test --all-targets
+
       # The local build signs what it produces, because macOS refuses
       # local-network connections from programs it does not trust. The script is
-      # a no-op on every platform but macOS.
+      # a no-op on every platform but macOS. It runs last on purpose: cargo
+      # relinks the binary when it builds the test targets, and a relink drops
+      # an ad-hoc signature. `make check` signs for the same reason.
       - name: Sign the binary (macOS only)
         if: runner.os == 'macOS'
         run: sh scripts/codesign-macos.sh target/debug/twin
-
-      - name: Run the test suite
-        run: cargo test --all-targets
 
   scale:
     # The 10k-file tree of F-071 is ignored by the default test run: F-021 puts

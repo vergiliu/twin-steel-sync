@@ -587,9 +587,6 @@ impl<S: Write> Write for &Duplex<S> {
 /// network. The connection completes at the TCP level and is then torn down, so
 /// the failure surfaces as EINVAL from setsockopt, EINVAL from getpeername and
 /// ENOTCONN from read — all of which look like bugs in the program.
-/// What macOS says when it refuses to let an unsigned program serve the local
-/// network: the connection completes at the TCP level and is then torn down, so
-/// the failure looks like EINVAL from setsockopt and ENOTCONN from reads.
 pub const LOCAL_NETWORK_REMEDY: &str = "\n  • quickest, no password needed — ad-hoc sign this binary, then restart it:\n      codesign -s - -f --identifier dev.twin.cli <path to twin>\n  • or allow it: System Settings → Network → Firewall → Options… → allow the twin binary\n  • or grant the permission: System Settings → Privacy & Security → Local Network → enable the app that launched twin\n  A running process keeps the decision it started with, so restart the server afterwards.\n  Rebuilding invalidates an ad-hoc signature: sign after each build, or install to a stable\n  path (`cargo install --path .`) and sign once.";
 
 /// One short line for the per-connection log.
