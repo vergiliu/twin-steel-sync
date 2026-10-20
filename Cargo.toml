@@ -1,6 +1,6 @@
 [package]
 name = "twin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Two-way directory synchronizer: local paths, or a host over mutual TLS"
 license = "MIT OR Apache-2.0"

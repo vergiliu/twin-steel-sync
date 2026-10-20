@@ -24,14 +24,11 @@ fn run(command: &mut Command) -> (i32, String) {
     (output.status.code().unwrap_or(-1), text)
 }
 
+/// The fingerprint of the identity in this data directory.
 fn fingerprint_of(data: &Path) -> String {
-    let (code, output) = run(client(data).arg("id"));
-    assert_eq!(code, 0, "twin id must work: {output}");
-    output
-        .lines()
-        .next()
-        .expect("a fingerprint on the first line")
-        .trim()
+    twin::tls::Identity::load_or_create(data)
+        .expect("the identity must be creatable")
+        .fingerprint()
         .to_string()
 }
 

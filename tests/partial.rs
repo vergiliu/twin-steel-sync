@@ -239,9 +239,10 @@ fn an_interrupted_transfer_over_tls_is_finished_by_the_next_run() {
     }
 
     // The client has an identity, and the server trusts it.
-    let (code, output) = run(client(&client_data).arg("id"));
-    assert_eq!(code, 0, "{output}");
-    let fingerprint = output.lines().next().unwrap().trim().to_string();
+    let fingerprint = twin::tls::Identity::load_or_create(&client_data)
+        .unwrap()
+        .fingerprint()
+        .to_string();
     let (code, output) = run(client(&server_data).arg("authorize").arg(&fingerprint));
     assert_eq!(code, 0, "{output}");
 
@@ -287,9 +288,10 @@ fn a_killed_transfer_keeps_its_partial_file_and_the_next_run_resumes_it() {
         fs::create_dir_all(dir).unwrap();
     }
 
-    let (code, output) = run(client(&client_data).arg("id"));
-    assert_eq!(code, 0, "{output}");
-    let fingerprint = output.lines().next().unwrap().trim().to_string();
+    let fingerprint = twin::tls::Identity::load_or_create(&client_data)
+        .unwrap()
+        .fingerprint()
+        .to_string();
     let (code, output) = run(client(&server_data).arg("authorize").arg(&fingerprint));
     assert_eq!(code, 0, "{output}");
 
@@ -389,9 +391,10 @@ fn a_corrupted_partial_file_over_tls_is_thrown_away() {
         fs::create_dir_all(dir).unwrap();
     }
 
-    let (code, output) = run(client(&client_data).arg("id"));
-    assert_eq!(code, 0, "{output}");
-    let fingerprint = output.lines().next().unwrap().trim().to_string();
+    let fingerprint = twin::tls::Identity::load_or_create(&client_data)
+        .unwrap()
+        .fingerprint()
+        .to_string();
     let (code, output) = run(client(&server_data).arg("authorize").arg(&fingerprint));
     assert_eq!(code, 0, "{output}");
 

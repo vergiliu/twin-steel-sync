@@ -191,13 +191,10 @@ fn doctor_can_check_the_far_end_over_the_wire() {
     let server_data = place._root.path().join("server-data");
     fs::create_dir_all(&server_data).unwrap();
 
-    let client_fp = {
-        let (code, output) = run(Command::new(binary())
-            .arg("id")
-            .env("TWIN_DATA_DIR", &place.data));
-        assert_eq!(code, 0, "{output}");
-        output.lines().next().unwrap().trim().to_string()
-    };
+    let client_fp = twin::tls::Identity::load_or_create(&place.data)
+        .unwrap()
+        .fingerprint()
+        .to_string();
     let server = Server::start(&place.root, &server_data, &[client_fp]);
     fs::write(place.root.join("content.txt"), "hello").unwrap();
 
@@ -236,13 +233,10 @@ fn doctor_says_the_handshake_failed_when_the_pin_is_wrong() {
     let place = scrubbed();
     let server_data = place._root.path().join("server-data");
     fs::create_dir_all(&server_data).unwrap();
-    let client_fp = {
-        let (code, output) = run(Command::new(binary())
-            .arg("id")
-            .env("TWIN_DATA_DIR", &place.data));
-        assert_eq!(code, 0, "{output}");
-        output.lines().next().unwrap().trim().to_string()
-    };
+    let client_fp = twin::tls::Identity::load_or_create(&place.data)
+        .unwrap()
+        .fingerprint()
+        .to_string();
     let server = Server::start(&place.root, &server_data, &[client_fp]);
 
     let (code, output) = run(Command::new(binary())

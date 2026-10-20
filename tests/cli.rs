@@ -9,11 +9,34 @@ fn twin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_twin"))
 }
 
+/// Everything a run printed: standard output first, then standard error.
+fn everything(output: &std::process::Output) -> String {
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text
+}
+
+/// The fingerprint a run printed, or an empty string when it printed none.
+fn fingerprint_line(output: &str) -> String {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("twin fingerprint: "))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// The clients this data directory lets in.
+fn authorized(data: &Path) -> Vec<String> {
+    twin::tls::read_list(&twin::tls::authorized_path(data)).unwrap()
+}
+
 struct Sandbox {
     _root: tempfile::TempDir,
     source: PathBuf,
     destination: PathBuf,
     archive: PathBuf,
+    data: PathBuf,
 }
 
 impl Sandbox {
@@ -22,7 +45,8 @@ impl Sandbox {
         let source = root.path().join("source");
         let destination = root.path().join("destination");
         let archive = root.path().join("archive");
-        for dir in [&source, &destination, &archive] {
+        let data = root.path().join("data");
+        for dir in [&source, &destination, &archive, &data] {
             fs::create_dir_all(dir).unwrap();
         }
         Sandbox {
@@ -30,19 +54,30 @@ impl Sandbox {
             source,
             destination,
             archive,
+            data,
         }
     }
 
     fn run(&self, args: &[&str]) -> (i32, String) {
         let output = Command::new(twin())
+            .env("TWIN_DATA_DIR", &self.data)
             .args(args)
             .arg("--archive-dir")
             .arg(&self.archive)
             .output()
             .unwrap();
-        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-        (output.status.code().unwrap_or(-1), text)
+        (output.status.code().unwrap_or(-1), everything(&output))
+    }
+
+    /// A run that needs no archive: the identity and the allow-list live in
+    /// the data directory.
+    fn run_plain(&self, args: &[&str]) -> (i32, String) {
+        let output = Command::new(twin())
+            .env("TWIN_DATA_DIR", &self.data)
+            .args(args)
+            .output()
+            .unwrap();
+        (output.status.code().unwrap_or(-1), everything(&output))
     }
 
     /// Copy the source to the destination.
@@ -59,6 +94,89 @@ impl Sandbox {
     fn read(&self, side: &Path, rel: &str) -> String {
         fs::read_to_string(side.join(rel)).unwrap()
     }
+}
+
+#[test]
+fn the_fingerprint_is_on_the_screen_from_the_first_moment() {
+    let sandbox = Sandbox::new();
+
+    // `--help` prints it too: there is no other place to look for it.
+    let (code, output) = sandbox.run_plain(&["--help"]);
+    assert_eq!(code, 0, "{output}");
+    let fingerprint = fingerprint_line(&output);
+    assert_eq!(
+        fingerprint.len(),
+        64,
+        "the fingerprint must be 64 hex characters: {output}"
+    );
+    assert!(
+        fingerprint.chars().all(|c| c.is_ascii_hexdigit()),
+        "the fingerprint must be hex: {output}"
+    );
+
+    // and every other run prints the same one.
+    fs::write(sandbox.source.join("a.txt"), "hello").unwrap();
+    let (code, output) = sandbox.sync();
+    assert_eq!(code, 0, "{output}");
+    assert!(
+        output.contains(&fingerprint),
+        "every run must print the fingerprint: {output}"
+    );
+}
+
+#[test]
+fn there_is_no_id_command_any_more() {
+    let sandbox = Sandbox::new();
+    let (code, output) = sandbox.run_plain(&["id"]);
+    assert_eq!(code, 2, "the id command is gone: {output}");
+    assert!(
+        output.contains("unrecognized subcommand"),
+        "the error must say so: {output}"
+    );
+}
+
+#[test]
+fn authorize_clear_removes_every_authorized_client() {
+    let sandbox = Sandbox::new();
+    let one = "ab".repeat(32);
+    let two = "cd".repeat(32);
+
+    for fingerprint in [&one, &two] {
+        let (code, output) = sandbox.run_plain(&["authorize", fingerprint]);
+        assert_eq!(code, 0, "{output}");
+    }
+    assert_eq!(
+        authorized(&sandbox.data).len(),
+        2,
+        "both must be in the list"
+    );
+
+    let (code, output) = sandbox.run_plain(&["authorize", "clear"]);
+    assert_eq!(code, 0, "{output}");
+    assert!(
+        output.contains("cleared 2"),
+        "the run must say how many it removed: {output}"
+    );
+    assert!(
+        authorized(&sandbox.data).is_empty(),
+        "every client must be gone: {output}"
+    );
+
+    // Clearing an empty list is not an error.
+    let (code, output) = sandbox.run_plain(&["authorize", "clear"]);
+    assert_eq!(code, 0, "{output}");
+    assert!(output.contains("cleared 0"), "{output}");
+}
+
+#[test]
+fn authorize_without_an_argument_says_what_to_give_it() {
+    let sandbox = Sandbox::new();
+    let (code, output) = sandbox.run_plain(&["authorize"]);
+    assert_eq!(code, 2, "{output}");
+    assert!(
+        output.contains("clear") && output.contains("fingerprint"),
+        "the error must say what is wanted: {output}"
+    );
 }
 
 #[test]

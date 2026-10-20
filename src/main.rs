@@ -21,12 +21,11 @@ struct Cli {
 enum Command {
     /// Copy the source to the destination. The source always wins.
     Sync(PairArgs),
-    /// Show this machine's fingerprint, creating its key on first use
-    Id,
     /// Let a client fingerprint connect to this machine's server
     Authorize {
-        /// The 64 hex characters printed by `twin id` on the client
-        fingerprint: String,
+        /// The 64 hex characters of the client, or `clear` to remove every
+        /// authorized client
+        fingerprint: Option<String>,
     },
     /// Serve one directory to authorized clients over mutual TLS
     Serve(ServeArgs),
@@ -109,16 +108,28 @@ struct PairArgs {
 }
 
 fn main() -> ExitCode {
+    // The other side has to be told about this machine, so the fingerprint is
+    // on the screen from the first moment — including for `--help`.
+    print_fingerprint();
+
     let cli = Cli::parse();
 
     twin::log::set_level_from_env();
 
     match cli.command {
-        Command::Id => print_id(),
-        Command::Authorize { fingerprint } => authorize(&fingerprint),
+        Command::Authorize { fingerprint } => authorize(fingerprint.as_deref()),
         Command::Serve(args) => serve(&args),
         Command::Doctor(args) => doctor(&args),
         Command::Sync(args) => sync(args),
+    }
+}
+
+/// This machine's fingerprint, on standard error so that the report on
+/// standard output stays machine-readable.
+fn print_fingerprint() {
+    match tls::Identity::load_or_create(&tls::data_dir()) {
+        Ok(identity) => eprintln!("twin fingerprint: {}", identity.fingerprint()),
+        Err(error) => eprintln!("twin fingerprint: unavailable ({error})"),
     }
 }
 
@@ -247,7 +258,7 @@ fn resolve_pin(remote: &RemoteOptions, given: Option<&str>) -> Result<String, St
         let normalized = tls::normalize_fingerprint(pin);
         if normalized.len() != 64 {
             return Err(format!(
-                "--pin needs the 64 hex characters printed by `twin id` on the server; got {} of them",
+                "--pin needs the 64 hex characters of the server's fingerprint; got {} of them",
                 normalized.len()
             ));
         }
@@ -257,7 +268,8 @@ fn resolve_pin(remote: &RemoteOptions, given: Option<&str>) -> Result<String, St
         Ok(Some(pin)) => Ok(pin),
         Ok(None) => Err(format!(
             "no pinned certificate for {label} yet.\n\
-             On the server run `twin id` and pass what it prints:\n  \
+             The server prints its fingerprint when it starts, and `twin --help` prints it too;\n\
+             pass that fingerprint with:\n  \
              twin sync <source> {label} --pin <fingerprint>",
             label = remote.label()
         )),
@@ -265,12 +277,21 @@ fn resolve_pin(remote: &RemoteOptions, given: Option<&str>) -> Result<String, St
     }
 }
 
-fn print_id() -> ExitCode {
-    match tls::Identity::load_or_create(&tls::data_dir()) {
-        Ok(identity) => {
-            println!("{}", identity.fingerprint());
-            eprintln!("certificate: {}", identity.cert_path().display());
-            eprintln!("private key: {}", identity.key_path().display());
+fn authorize(fingerprint: Option<&str>) -> ExitCode {
+    let Some(argument) = fingerprint else {
+        eprintln!("error: give the fingerprint of the client, or `clear` to remove every authorized client");
+        return ExitCode::from(2);
+    };
+    if argument.eq_ignore_ascii_case("clear") {
+        return clear_authorized();
+    }
+    match tls::add_authorized(&tls::data_dir(), argument) {
+        Ok(list) => {
+            println!("authorized ({} total)", list.len());
+            for entry in list {
+                println!("  {entry}");
+            }
+            println!("takes effect on the next connection; the server needs no restart");
             ExitCode::from(0)
         }
         Err(error) => {
@@ -280,13 +301,11 @@ fn print_id() -> ExitCode {
     }
 }
 
-fn authorize(fingerprint: &str) -> ExitCode {
-    match tls::add_authorized(&tls::data_dir(), fingerprint) {
-        Ok(list) => {
-            println!("authorized ({} total)", list.len());
-            for entry in list {
-                println!("  {entry}");
-            }
+/// Remove every authorized client at once.
+fn clear_authorized() -> ExitCode {
+    match tls::clear_authorized(&tls::data_dir()) {
+        Ok(count) => {
+            println!("cleared {count} authorized client(s)");
             println!("takes effect on the next connection; the server needs no restart");
             ExitCode::from(0)
         }

@@ -10,11 +10,23 @@ launchd when you want it periodic.
 
 ```
 twin sync <source> <destination>   # copy the source to the destination
-twin id                            # this machine's fingerprint
 twin authorize <fingerprint>       # let that client connect to this server
+twin authorize clear               # let nobody in
 twin serve --root <dir>            # serve a directory over mutual TLS
 twin doctor [PATH]                 # check everything a sync depends on
 ```
+
+Every run prints this machine's fingerprint before it does anything else, so
+there is always a way to see it — no separate `id` command:
+
+```
+$ twin --help
+twin fingerprint: 281c324175dbea089985b27e024de74fb90553116b62a274deb4d6e165181566
+...
+```
+
+The fingerprint goes to standard error, so the report on standard output stays
+machine-readable (`--json` is one JSON object per line, nothing else).
 
 The order of the two arguments is the direction: the content flows from the
 first to the second, and only the second is written. The source wins — a file
@@ -24,9 +36,31 @@ so.
 
 ## What changed
 
-`push`, `pull` and `verify` are gone. `sync` is the only way to move content,
-and it always moves it from the source to the destination, in the order the two
-arguments are written:
+### The fingerprint is printed on startup, and `twin id` is gone
+
+`twin id` used to be the way to find out this machine's fingerprint, which is
+the one thing you need on the other machine. Now every run prints it:
+
+```
+twin fingerprint: 281c324175dbea089985b27e024de74fb90553116b62a274deb4d6e165181566
+```
+
+It is printed before the program does anything, `--help` included, so
+`twin --help` is enough to get it. The key pair is created on first use, as
+before. The messages that used to say "run `twin id`" now say to run `twin`.
+
+### `twin authorize clear`
+
+`twin authorize <fingerprint>` lets one client in; `twin authorize clear` lets
+nobody in — it empties the list and says how many clients it removed. A
+running server reads the list before every connection, so the clients are
+refused from its next connection, with no restart.
+
+
+### `push`, `pull` and `verify` are gone
+
+`sync` is the only way to move content, and it always moves it from the source
+to the destination, in the order the two arguments are written:
 
 | Before | Now |
 |---|---|

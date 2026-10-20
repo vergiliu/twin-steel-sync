@@ -6,7 +6,7 @@
 
 One binary. No server to deploy, no daemon, no accounts, no config file, no chunk store. You run it, it copies the pair, it exits. Schedule it with cron / systemd timer / launchd when you want it periodic.
 
-Prerequisites for a remote pair: `twin` installed on both machines, and a one-time exchange of certificate fingerprints (`twin id` there, `twin authorize <fingerprint>` here, `--pin <fingerprint>` on the first run). After that the client remembers the pin.
+Prerequisites for a remote pair: `twin` installed on both machines, and a one-time exchange of certificate fingerprints (every run of `twin` prints this machine's fingerprint, so run it on the client, then `twin authorize <fingerprint>` on the server, and pass `--pin <fingerprint>` on the first sync). After that the client remembers the pin.
 
 > This document was corrected against the implementation. Two kinds of marks appear inline: **partly** — the requirement is not fully implemented, and the gap is in [PENDING.md](PENDING.md); **corrected** — the requirement text promised something the code never did, and it now describes what the program actually does. Every **partly** row has an entry in PENDING.md; the **corrected** ones have no open work behind them.
 
@@ -88,10 +88,12 @@ Comparison per path — current source vs archive vs current destination:
 
 ```
 twin sync <source> <destination>  # copy the source to the destination
-twin id                           # this machine's fingerprint (creates its key)
 twin authorize <fingerprint>      # let that client connect to this server
+twin authorize clear              # let nobody in
 twin serve --root <dir>           # serve a directory over mutual TLS
 ```
+
+There is no `id` command: every run prints this machine's fingerprint before it does anything else, so there is always a way to see it.
 
 The order of the two arguments is the direction: the content flows from the first to the second, and only the second is written. One of the two must be a directory on this machine.
 
@@ -104,6 +106,8 @@ The order of the two arguments is the direction: the content flows from the firs
 | F-054 | Output restraint | Default output is a short summary; `-v` adds per-file lines; `--quiet` prints only errors |
 | F-055 | Diagnostics | Failures name the operation and the path (`storing /srv/docs/a.txt: ...`), never a bare errno. Leveled diagnostics on stderr, off by default, raised by `-v`/`-vv` or `TWIN_LOG=error\|warn\|info\|debug` |
 | F-056 | `twin doctor [PATH] [--remote ADDR --pin HEX]` | Probes the data dir, identity (key permissions, key↔cert usability), temp dir, archive integrity, free space, and the sync root's real abilities — create, atomic replace, mtime precision, fsync — plus whether this host's own network policy lets this program be reached on the local network (macOS firewall / local-network permission), naming the fixes that work — an ad-hoc signature (`codesign -s - -f --identifier dev.twin.cli <binary>`, no password needed), a firewall allowance, or granting Local Network access — and warning that a running server keeps the decision it started with. Then TCP/TLS/handshake/listing against a server. One line per check; exits 1 if anything failed |
+| F-057 | Startup fingerprint | Every run prints this machine's fingerprint on standard error before it does anything else — `twin fingerprint: <64 hex>` — so the other side can be told about it without a separate command. `--help` prints it too. The report on standard output stays machine-readable |
+| F-058 | `twin authorize clear` | Removes every authorized client at once and says how many there were. The list is read back before every connection, so a running server refuses every client from its next connection. `twin authorize` without an argument says what it wants |
 
 ## 7. Correctness and safety
 
@@ -134,10 +138,10 @@ The order of the two arguments is the direction: the content flows from the firs
 
 1. Compare + plan + `--dry-run` (pure functions over two directory walks) — testable with zero I/O risk. **Done**
 2. Local pair transfer with archive, atomic placement, `--backup`. **Done**
-3. Remote transport + `serve` + handshake + resume. **Done** over mutual TLS (`twin serve`, `twin id`, `twin authorize`, pinning), with `--partial` (F-023) resuming an interrupted transfer
+3. Remote transport + `serve` + handshake + resume. **Done** over mutual TLS (`twin serve`, `twin authorize`, pinning), with `--partial` (F-023) resuming an interrupted transfer
 4. Deletions and guards. **Done**
 5. `--json`, progress, exit codes, docs. **Done**: `--json` (F-052), progress (F-053), exit codes (F-051/F-015), diagnostics and `twin doctor` (F-054/F-055/F-056)
 
 On macOS a binary must be signed before the system lets it serve the local network, so the build signs what it produces: `make build` / `make release` run `scripts/codesign-macos.sh` (ad-hoc, no certificate and no sudo; a no-op on Linux, and it skips an already-signed file). `twin serve` warns at startup when the running binary is unsigned, and `twin doctor` reports `binary signature` next to `local network accepts connections`.
 
-No daemon, no accounts, no CA, no protocol versioning beyond one handshake line. Dependencies: `clap`, `ignore`, `blake3`, `rusqlite`, `rustls`, `rcgen`, `rustls-pemfile`, `sha2`, `filetime`, `libc`. 46 requirements instead of 126, of which 6 are only partly implemented — the gap for each is in [PENDING.md](PENDING.md).
+No daemon, no accounts, no CA, no protocol versioning beyond one handshake line. Dependencies: `clap`, `ignore`, `blake3`, `rusqlite`, `rustls`, `rcgen`, `rustls-pemfile`, `sha2`, `filetime`, `libc`. 48 requirements instead of 126, of which 6 are only partly implemented — the gap for each is in [PENDING.md](PENDING.md).

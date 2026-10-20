@@ -40,8 +40,9 @@ fn is_refusal(error: &io::Error) -> bool {
 fn handshake_error(label: &str, error: io::Error) -> io::Error {
     let text = error.to_string();
     let hint = if is_refusal(&error) {
-        "this client is not allowed there: run `twin id` here, then `twin authorize <fingerprint>` \
-         on the server — it takes effect on the next connection"
+        "this client is not allowed there: run `twin` here to print this machine's \
+         fingerprint, then `twin authorize <fingerprint>` on the server — it takes \
+         effect on the next connection"
     } else {
         "the other side did not speak the twin protocol"
     };

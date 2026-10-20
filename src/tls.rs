@@ -449,8 +449,9 @@ pub fn connect(
     if let Err(error) = stream.conn.complete_io(&mut stream.sock) {
         return Err(io::Error::other(format!(
             "{host}:{port}: the TLS handshake failed: {error}. Is this client authorized there \
-             (`twin id` here, then `twin authorize <fingerprint>` on the server — it takes effect \
-             on the next connection), and does the pin match?"
+             (run `twin` here to print this machine's fingerprint, then `twin authorize \
+             <fingerprint>` on the server — it takes effect on the next connection), and does \
+             the pin match?"
         )));
     }
     crate::debug!("handshake with {host}:{port} done");
@@ -474,7 +475,8 @@ pub fn serve_forever(
     if allowed_fingerprints(allowed).is_empty() {
         return Err(io::Error::other(
             "no clients are authorized yet, so every connection would be refused.\n\
-             On this machine run `twin id` on the client, then `twin authorize <fingerprint>` here.",
+             Run `twin` on the client to print its fingerprint, then `twin authorize <fingerprint>` \
+             here.",
         ));
     }
     let config = server_config(identity, allowed)?;
@@ -745,6 +747,18 @@ pub fn add_authorized(dir: &Path, fingerprint: &str) -> io::Result<Vec<String>> 
         fs::write(&path, format!("{}\n", list.join("\n")))?;
     }
     Ok(list)
+}
+
+/// Remove every authorized client at once, and say how many there were.
+///
+/// The list is read back before every connection, so a running server stops
+/// letting them in from its next connection.
+pub fn clear_authorized(dir: &Path) -> io::Result<usize> {
+    let path = authorized_path(dir);
+    let list = read_list(&path)?;
+    fs::create_dir_all(dir)?;
+    fs::write(&path, "")?;
+    Ok(list.len())
 }
 
 pub fn read_pin(dir: &Path, host: &str, port: u16) -> io::Result<Option<String>> {
