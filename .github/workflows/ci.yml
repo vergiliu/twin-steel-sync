@@ -92,7 +92,9 @@ jobs:
     # where it can have a timeout of its own.
     name: scale (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # Ten thousand files, one fsync each: this job is allowed to take a long
+    # time on macOS, where that fsync is an F_FULLFSYNC.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
