@@ -324,6 +324,10 @@ impl Backend for RemoteBackend {
         &self.label
     }
 
+    fn local_root(&self) -> Option<&Path> {
+        None
+    }
+
     fn walk(&mut self) -> io::Result<Option<Result<Entry, PathFailure>>> {
         if !self.listing_done && self.spool.is_none() {
             self.read_listing()?;

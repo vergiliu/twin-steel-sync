@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 pub trait Backend {
     /// Human-facing identity, used in messages.
     fn label(&self) -> &str;
+    /// The directory this end lives in, when it is a directory on this
+    /// machine. A peer on the far end of a connection has none: its content
+    /// only reaches this machine through a transfer.
+    fn local_root(&self) -> Option<&Path>;
     /// Next entry in component order; `None` at the end of the tree. A path
     /// that cannot be read is reported on its own, not as a failure of the
     /// whole walk.
@@ -40,10 +44,6 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
-    pub fn new(root: &Path, rules: IgnoreRules) -> io::Result<Self> {
-        Self::excluding(root, rules, Vec::new())
-    }
-
     /// A backend that never walks into the given absolute directories.
     pub fn excluding(root: &Path, rules: IgnoreRules, excluded: Vec<PathBuf>) -> io::Result<Self> {
         Ok(LocalBackend {
@@ -70,6 +70,10 @@ pub fn temp_for(dst: &Path) -> PathBuf {
 impl Backend for LocalBackend {
     fn label(&self) -> &str {
         &self.label
+    }
+
+    fn local_root(&self) -> Option<&Path> {
+        Some(&self.root)
     }
 
     fn walk(&mut self) -> io::Result<Option<Result<Entry, PathFailure>>> {

@@ -2,35 +2,34 @@ use filetime::FileTime;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use twin::engine::{run, Mode, RunOptions, Summary};
+use twin::engine::{run, End, RunOptions, Summary};
 
 struct Pair {
     _root: tempfile::TempDir,
-    local: PathBuf,
-    remote: PathBuf,
+    source: PathBuf,
+    destination: PathBuf,
     archive: PathBuf,
 }
 
 impl Pair {
     fn new() -> Pair {
         let root = tempfile::tempdir().unwrap();
-        let local = root.path().join("local");
-        let remote = root.path().join("remote");
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
         let archive = root.path().join("archive");
-        fs::create_dir_all(&local).unwrap();
-        fs::create_dir_all(&remote).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
         fs::create_dir_all(&archive).unwrap();
         Pair {
             _root: root,
-            local,
-            remote,
+            source,
+            destination,
             archive,
         }
     }
 
-    fn options(&self, mode: Mode) -> RunOptions {
+    fn options(&self) -> RunOptions {
         RunOptions {
-            mode,
             auto: true,
             archive_dir: self.archive.clone(),
             quiet: true,
@@ -40,7 +39,28 @@ impl Pair {
 
     fn go(&self, options: &RunOptions) -> (Summary, String) {
         let mut out = Vec::new();
-        let summary = run(&self.local, &self.remote, options, &mut out).unwrap();
+        let summary = run(
+            &End::Local(self.source.clone()),
+            &End::Local(self.destination.clone()),
+            None,
+            options,
+            &mut out,
+        )
+        .unwrap();
+        (summary, String::from_utf8(out).unwrap())
+    }
+
+    /// The same pair, the other way round: the destination becomes the source.
+    fn go_backwards(&self, options: &RunOptions) -> (Summary, String) {
+        let mut out = Vec::new();
+        let summary = run(
+            &End::Local(self.destination.clone()),
+            &End::Local(self.source.clone()),
+            None,
+            options,
+            &mut out,
+        )
+        .unwrap();
         (summary, String::from_utf8(out).unwrap())
     }
 
@@ -60,25 +80,16 @@ impl Pair {
 
     fn root(&self, side: Side) -> &Path {
         match side {
-            Side::Local => &self.local,
-            Side::Remote => &self.remote,
+            Side::Source => &self.source,
+            Side::Destination => &self.destination,
         }
-    }
-
-    fn names(&self, side: Side) -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(self.root(side))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-            .collect();
-        names.sort();
-        names
     }
 }
 
 #[derive(Clone, Copy)]
 enum Side {
-    Local,
-    Remote,
+    Source,
+    Destination,
 }
 
 fn plan_lines(output: &str) -> Vec<String> {
@@ -92,179 +103,187 @@ fn plan_lines(output: &str) -> Vec<String> {
 #[test]
 fn first_run_copies_then_settles() {
     let pair = Pair::new();
-    pair.put(Side::Local, "notes/a.txt", "hello");
-    pair.put(Side::Local, "b.txt", "world");
+    pair.put(Side::Source, "notes/a.txt", "hello");
+    pair.put(Side::Source, "b.txt", "world");
 
-    let (summary, _) = pair.go(&pair.options(Mode::Sync));
+    let (summary, _) = pair.go(&pair.options());
     assert_eq!(summary.created, 2, "both files are new");
-    assert_eq!(pair.get(Side::Remote, "notes/a.txt"), "hello");
-    assert_eq!(pair.get(Side::Remote, "b.txt"), "world");
+    assert_eq!(pair.get(Side::Destination, "notes/a.txt"), "hello");
+    assert_eq!(pair.get(Side::Destination, "b.txt"), "world");
 
-    let (second, _) = pair.go(&pair.options(Mode::Sync));
+    let (second, _) = pair.go(&pair.options());
     assert_eq!(
-        (
-            second.created,
-            second.updated,
-            second.deleted,
-            second.conflicts
-        ),
-        (0, 0, 0, 0),
+        (second.created, second.updated, second.deleted),
+        (0, 0, 0),
         "a settled pair must be a no-op"
     );
     assert_eq!(second.unchanged, 2);
 }
 
 #[test]
-fn edits_propagate_whichever_side_they_happen_on() {
+fn a_file_both_ends_already_hold_is_remembered() {
     let pair = Pair::new();
-    pair.put(Side::Local, "f.txt", "one");
-    pair.go(&pair.options(Mode::Sync));
+    pair.put(Side::Source, "same.txt", "same");
+    pair.put(Side::Destination, "same.txt", "same");
 
-    pair.put(Side::Local, "f.txt", "two");
-    let (summary, _) = pair.go(&pair.options(Mode::Sync));
-    assert_eq!(summary.updated, 1);
-    assert_eq!(pair.get(Side::Remote, "f.txt"), "two");
+    let (summary, _) = pair.go(&pair.options());
+    assert_eq!(summary.created, 0, "there is nothing to copy");
+    assert_eq!(summary.updated, 0);
+    assert_eq!(summary.unchanged, 1);
 
-    pair.put(Side::Remote, "f.txt", "three");
-    let (summary, _) = pair.go(&pair.options(Mode::Sync));
-    assert_eq!(summary.updated, 1);
-    assert_eq!(pair.get(Side::Local, "f.txt"), "three");
+    // The archive must know the path, or the next run would hash both ends
+    // again for nothing.
+    let archive = twin::archive::Archive::open(&archive_file(&pair.archive)).unwrap();
+    let row = archive
+        .get(Path::new("same.txt"))
+        .unwrap()
+        .expect("a path both ends hold must be recorded in the archive");
+    assert_eq!(
+        row.hash,
+        twin::fsutil::hash_file(&pair.source.join("same.txt")).unwrap(),
+        "the recorded hash must be the content both ends hold"
+    );
+    // Each end keeps its own timestamp: the fast path matches them apart.
+    assert_eq!(
+        row.mtime_source,
+        twin::fsutil::mtime_ns(&fs::metadata(pair.source.join("same.txt")).unwrap())
+    );
+    assert_eq!(
+        row.mtime_destination,
+        twin::fsutil::mtime_ns(&fs::metadata(pair.destination.join("same.txt")).unwrap())
+    );
 }
 
-#[test]
-fn deletion_propagates_only_when_the_survivor_is_untouched() {
-    let pair = Pair::new();
-    pair.put(Side::Local, "gone.txt", "x");
-    pair.put(Side::Local, "kept.txt", "y");
-    pair.go(&pair.options(Mode::Sync));
-
-    fs::remove_file(pair.remote.join("gone.txt")).unwrap();
-    let (summary, _) = pair.go(&pair.options(Mode::Sync));
-    assert_eq!(summary.deleted, 1);
-    assert!(
-        !pair.exists(Side::Local, "gone.txt"),
-        "deletion must propagate"
-    );
-    assert!(pair.exists(Side::Local, "kept.txt"));
-}
-
-#[test]
-fn concurrent_edits_keep_both_versions() {
-    let pair = Pair::new();
-    pair.put(Side::Local, "doc.txt", "original");
-    pair.go(&pair.options(Mode::Sync));
-
-    pair.put(Side::Local, "doc.txt", "local version");
-    pair.put(Side::Remote, "doc.txt", "remote version");
-
-    let mut loud = pair.options(Mode::Sync);
-    loud.quiet = false;
-    let (summary, output) = pair.go(&loud);
-    assert_eq!(summary.conflicts, 1);
-    assert!(
-        output.contains("conflict"),
-        "the user must be told: {output}"
-    );
-
-    let copies: Vec<String> = pair
-        .names(Side::Local)
-        .into_iter()
-        .filter(|n| n.contains(".conflict-"))
+/// The one archive file of a pair.
+fn archive_file(dir: &Path) -> PathBuf {
+    let mut found: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("db"))
         .collect();
-    assert_eq!(
-        copies.len(),
-        1,
-        "local keeps its name, the other version is kept beside it"
-    );
-    assert!(
-        pair.exists(Side::Remote, &copies[0]),
-        "both sides carry both versions"
-    );
+    found.sort();
+    assert_eq!(found.len(), 1, "expected exactly one archive: {found:?}");
+    found.remove(0)
+}
 
-    let mut both = vec![
-        pair.get(Side::Local, "doc.txt"),
-        pair.get(Side::Remote, "doc.txt"),
-        pair.get(Side::Local, &copies[0]),
-        pair.get(Side::Remote, &copies[0]),
-    ];
-    both.sort();
+#[test]
+fn the_source_always_wins() {
+    let pair = Pair::new();
+    pair.put(Side::Source, "f.txt", "one");
+    pair.go(&pair.options());
+
+    pair.put(Side::Source, "f.txt", "two");
+    let (summary, _) = pair.go(&pair.options());
+    assert_eq!(summary.updated, 1);
+    assert_eq!(pair.get(Side::Destination, "f.txt"), "two");
+
+    // A version of its own on the destination is not kept: the source decides.
+    pair.put(Side::Destination, "f.txt", "three");
+    let (summary, _) = pair.go(&pair.options());
+    assert_eq!(summary.updated, 1);
+    assert_eq!(pair.get(Side::Destination, "f.txt"), "two");
     assert_eq!(
-        both,
-        vec![
-            "local version",
-            "local version",
-            "remote version",
-            "remote version"
-        ]
+        pair.get(Side::Source, "f.txt"),
+        "two",
+        "the source is never written to"
     );
 }
 
 #[test]
-fn an_edited_file_survives_deletion_on_the_other_side() {
+fn the_arguments_decide_the_direction() {
     let pair = Pair::new();
-    pair.put(Side::Local, "work.txt", "v1");
-    pair.go(&pair.options(Mode::Sync));
+    pair.put(Side::Source, "doc.txt", "from the source");
+    pair.put(Side::Destination, "doc.txt", "from the destination");
 
-    fs::remove_file(pair.remote.join("work.txt")).unwrap();
-    pair.put(Side::Local, "work.txt", "v2 edited");
+    let (summary, _) = pair.go(&pair.options());
+    assert_eq!(summary.updated, 1);
+    assert_eq!(pair.get(Side::Destination, "doc.txt"), "from the source");
 
-    let mut loud = pair.options(Mode::Sync);
-    loud.quiet = false;
-    let (summary, output) = pair.go(&loud);
-    assert_eq!(summary.created, 1, "the edit is restored to the other side");
-    assert_eq!(pair.get(Side::Local, "work.txt"), "v2 edited");
-    assert_eq!(pair.get(Side::Remote, "work.txt"), "v2 edited");
-    assert!(
-        output.contains("restore"),
-        "resurrections are reported: {output}"
+    // The other way round, the other file wins.
+    pair.put(Side::Destination, "doc.txt", "from the destination");
+    let (summary, _) = pair.go_backwards(&pair.options());
+    assert_eq!(summary.updated, 1);
+    assert_eq!(pair.get(Side::Source, "doc.txt"), "from the destination");
+    assert_eq!(
+        pair.get(Side::Destination, "doc.txt"),
+        "from the destination",
+        "the source is never written to"
     );
+}
+
+#[test]
+fn a_file_deleted_on_the_source_stays_unless_asked_to_be_removed() {
+    let pair = Pair::new();
+    pair.put(Side::Source, "gone.txt", "x");
+    pair.put(Side::Source, "kept.txt", "y");
+    pair.go(&pair.options());
+
+    fs::remove_file(pair.source.join("gone.txt")).unwrap();
+    let (summary, _) = pair.go(&pair.options());
+    assert_eq!(summary.deleted, 0, "nothing is removed without --delete");
+    assert!(
+        pair.exists(Side::Destination, "gone.txt"),
+        "the destination keeps what the source no longer has"
+    );
+    assert!(pair.exists(Side::Destination, "kept.txt"));
+
+    let mut deleting = pair.options();
+    deleting.delete = true;
+    let (summary, _) = pair.go(&deleting);
+    assert_eq!(summary.deleted, 1);
+    assert!(!pair.exists(Side::Destination, "gone.txt"));
+    assert!(pair.exists(Side::Destination, "kept.txt"));
 }
 
 #[test]
 fn mass_deletion_is_refused_without_force() {
     let pair = Pair::new();
     for i in 0..200 {
-        pair.put(Side::Local, &format!("many/f{i:03}.txt"), "x");
+        pair.put(Side::Source, &format!("many/f{i:03}.txt"), "x");
     }
-    pair.go(&pair.options(Mode::Sync));
+    pair.go(&pair.options());
 
     for i in 0..150 {
-        fs::remove_file(pair.local.join(format!("many/f{i:03}.txt"))).unwrap();
+        fs::remove_file(pair.source.join(format!("many/f{i:03}.txt"))).unwrap();
     }
 
-    let (summary, output) = pair.go(&pair.options(Mode::Sync));
+    let mut deleting = pair.options();
+    deleting.delete = true;
+    let (summary, output) = pair.go(&deleting);
     assert!(summary.aborted, "the guard must stop this: {output}");
     assert!(
-        pair.exists(Side::Remote, "many/f000.txt"),
+        pair.exists(Side::Destination, "many/f000.txt"),
         "nothing may be deleted"
     );
-    assert!(pair.exists(Side::Local, "many/f199.txt"));
+    assert!(pair.exists(Side::Source, "many/f199.txt"));
 
-    let mut forced = pair.options(Mode::Sync);
+    let mut forced = pair.options();
+    forced.delete = true;
     forced.force = true;
     let (summary, _) = pair.go(&forced);
     assert_eq!(summary.deleted, 150);
-    assert!(!pair.exists(Side::Remote, "many/f000.txt"));
+    assert!(!pair.exists(Side::Destination, "many/f000.txt"));
 }
 
 #[test]
 fn dry_run_changes_nothing_and_reports_exactly_what_a_real_run_does() {
     let pair = Pair::new();
-    pair.put(Side::Local, "one.txt", "1");
-    pair.put(Side::Local, "dir/two.txt", "2");
+    pair.put(Side::Source, "one.txt", "1");
+    pair.put(Side::Source, "dir/two.txt", "2");
 
-    let mut preview = pair.options(Mode::Sync);
+    let mut preview = pair.options();
     preview.dry_run = true;
     preview.verbose = true;
     let (planned, planned_output) = pair.go(&preview);
     assert_eq!(planned.created, 2);
     assert!(
-        !pair.exists(Side::Remote, "one.txt"),
+        !pair.exists(Side::Destination, "one.txt"),
         "dry run must not write"
     );
-    assert!(!pair.exists(Side::Remote, "dir/two.txt"));
+    assert!(!pair.exists(Side::Destination, "dir/two.txt"));
 
-    let mut real = pair.options(Mode::Sync);
+    let mut real = pair.options();
     real.verbose = true;
     let (performed, performed_output) = pair.go(&real);
     assert_eq!(performed.created, 2);
@@ -278,48 +297,48 @@ fn dry_run_changes_nothing_and_reports_exactly_what_a_real_run_does() {
 #[test]
 fn metadata_fast_path_can_miss_edits_unless_asked_to_hash() {
     let pair = Pair::new();
-    pair.put(Side::Local, "sneaky.txt", "aaaa");
-    pair.go(&pair.options(Mode::Sync));
-    let original = fs::metadata(pair.local.join("sneaky.txt")).unwrap();
+    pair.put(Side::Source, "sneaky.txt", "aaaa");
+    pair.go(&pair.options());
+    let original = fs::metadata(pair.source.join("sneaky.txt")).unwrap();
 
-    pair.put(Side::Local, "sneaky.txt", "bbbb");
+    pair.put(Side::Source, "sneaky.txt", "bbbb");
     filetime::set_file_mtime(
-        pair.local.join("sneaky.txt"),
+        pair.source.join("sneaky.txt"),
         FileTime::from_unix_time(original.mtime(), original.mtime_nsec() as u32),
     )
     .unwrap();
 
-    let (summary, _) = pair.go(&pair.options(Mode::Sync));
+    let (summary, _) = pair.go(&pair.options());
     assert_eq!(
         summary.updated, 0,
         "size and mtime unchanged: nothing looks different"
     );
-    assert_eq!(pair.get(Side::Remote, "sneaky.txt"), "aaaa");
+    assert_eq!(pair.get(Side::Destination, "sneaky.txt"), "aaaa");
 
-    let mut hashing = pair.options(Mode::Sync);
+    let mut hashing = pair.options();
     hashing.checksum = true;
     let (summary, _) = pair.go(&hashing);
     assert_eq!(summary.updated, 1, "--checksum must find it");
-    assert_eq!(pair.get(Side::Remote, "sneaky.txt"), "bbbb");
+    assert_eq!(pair.get(Side::Destination, "sneaky.txt"), "bbbb");
 }
 
 #[test]
 fn ignored_paths_stay_put_and_do_not_haunt_later_runs() {
     let pair = Pair::new();
-    fs::write(pair.local.join(".twinignore"), "*.log\nbuild/\n").unwrap();
-    pair.put(Side::Local, "keep.txt", "keep");
-    pair.put(Side::Local, "noise.log", "noise");
-    pair.put(Side::Local, "build/artifact", "artifact");
+    fs::write(pair.source.join(".twinignore"), "*.log\nbuild/\n").unwrap();
+    pair.put(Side::Source, "keep.txt", "keep");
+    pair.put(Side::Source, "noise.log", "noise");
+    pair.put(Side::Source, "build/artifact", "artifact");
 
-    let (summary, _) = pair.go(&pair.options(Mode::Sync));
+    let (summary, _) = pair.go(&pair.options());
     assert_eq!(
         summary.created, 2,
         "only the ignore file and keep.txt travel"
     );
-    assert!(!pair.exists(Side::Remote, "noise.log"));
-    assert!(!pair.exists(Side::Remote, "build/artifact"));
+    assert!(!pair.exists(Side::Destination, "noise.log"));
+    assert!(!pair.exists(Side::Destination, "build/artifact"));
 
-    let (second, _) = pair.go(&pair.options(Mode::Sync));
+    let (second, _) = pair.go(&pair.options());
     assert_eq!(
         second.created + second.updated + second.deleted,
         0,
@@ -328,41 +347,63 @@ fn ignored_paths_stay_put_and_do_not_haunt_later_runs() {
 }
 
 #[test]
-fn push_is_one_way_and_only_deletes_with_the_flag() {
+fn the_source_is_read_and_the_destination_is_written() {
     let pair = Pair::new();
-    pair.put(Side::Local, "a.txt", "local");
-    pair.put(Side::Remote, "extra.txt", "only here");
+    pair.put(Side::Source, "a.txt", "local");
+    pair.put(Side::Destination, "extra.txt", "only here");
 
-    let (summary, _) = pair.go(&pair.options(Mode::Push));
+    let (summary, _) = pair.go(&pair.options());
     assert_eq!(summary.created, 1);
-    assert_eq!(pair.get(Side::Remote, "a.txt"), "local");
+    assert_eq!(pair.get(Side::Destination, "a.txt"), "local");
     assert!(
-        pair.exists(Side::Remote, "extra.txt"),
+        pair.exists(Side::Destination, "extra.txt"),
         "no deletion without --delete"
     );
     assert!(
-        !pair.exists(Side::Local, "extra.txt"),
-        "push never writes to the local side"
+        !pair.exists(Side::Source, "extra.txt"),
+        "the source is never written to"
     );
 
-    let mut deleting = pair.options(Mode::Push);
+    let mut deleting = pair.options();
     deleting.delete = true;
     let (summary, _) = pair.go(&deleting);
     assert_eq!(summary.deleted, 1);
-    assert!(!pair.exists(Side::Remote, "extra.txt"));
+    assert!(!pair.exists(Side::Destination, "extra.txt"));
 }
 
 #[test]
 fn roots_that_contain_each_other_are_refused() {
     let pair = Pair::new();
-    let mut options = pair.options(Mode::Sync);
-    options.auto = true;
+    let options = pair.options();
     let mut out = Vec::new();
-    let nested = pair.local.join("inside");
+    let nested = pair.source.join("inside");
     fs::create_dir_all(&nested).unwrap();
-    let error = run(&pair.local, &nested, &options, &mut out).unwrap_err();
+    let error = run(
+        &End::Local(pair.source.clone()),
+        &End::Local(nested),
+        None,
+        &options,
+        &mut out,
+    )
+    .unwrap_err();
     assert!(
         error.to_string().contains("must not contain each other"),
         "got: {error}"
     );
+}
+
+#[test]
+fn the_same_directory_on_both_sides_is_refused() {
+    let pair = Pair::new();
+    let options = pair.options();
+    let mut out = Vec::new();
+    let error = run(
+        &End::Local(pair.source.clone()),
+        &End::Local(pair.source.clone()),
+        None,
+        &options,
+        &mut out,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("same directory"), "got: {error}");
 }

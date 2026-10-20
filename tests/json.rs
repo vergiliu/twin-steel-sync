@@ -143,9 +143,11 @@ impl Sandbox {
         }
     }
 
-    fn run(&self, verb: &str, extra: &[&str]) -> (i32, String, String) {
+    /// Copy the local directory to the remote one: the local side is the
+    /// source, the remote side the destination.
+    fn run(&self, extra: &[&str]) -> (i32, String, String) {
         let output = Command::new(twin())
-            .arg(verb)
+            .arg("sync")
             .arg(&self.local)
             .arg(&self.remote)
             .args(extra)
@@ -161,8 +163,8 @@ impl Sandbox {
     }
 
     /// The event stream: standard output only, one object per line.
-    fn json(&self, verb: &str, extra: &[&str]) -> (i32, Vec<Object>) {
-        let (code, stdout, stderr) = self.run(verb, &{
+    fn json(&self, extra: &[&str]) -> (i32, Vec<Object>) {
+        let (code, stdout, stderr) = self.run(&{
             let mut args = vec!["--json"];
             args.extend_from_slice(extra);
             args
@@ -195,7 +197,7 @@ fn every_line_is_an_object_and_the_last_one_is_the_summary() {
     sandbox.write(&sandbox.local, "a.txt", "one");
     sandbox.write(&sandbox.local, "dir/b.txt", "two");
 
-    let (code, events) = sandbox.json("sync", &["--auto"]);
+    let (code, events) = sandbox.json(&["--auto"]);
     assert_eq!(code, 0);
     assert!(events.len() >= 3, "{events:?}");
     for event in &events {
@@ -217,7 +219,7 @@ fn a_transfer_is_reported_from_start_to_finish() {
     let sandbox = Sandbox::new();
     sandbox.write(&sandbox.local, "a.txt", "one");
 
-    let (code, events) = sandbox.json("sync", &["--auto"]);
+    let (code, events) = sandbox.json(&["--auto"]);
     assert_eq!(code, 0);
     let transfers: Vec<&Object> = events
         .iter()
@@ -227,34 +229,36 @@ fn a_transfer_is_reported_from_start_to_finish() {
     assert_eq!(transfers[0].get("phase").unwrap().text(), "start");
     assert_eq!(transfers[1].get("phase").unwrap().text(), "done");
     assert_eq!(transfers[1].get("path").unwrap().text(), "a.txt");
-    assert_eq!(transfers[1].get("from").unwrap().text(), "local");
-    assert_eq!(transfers[1].get("to").unwrap().text(), "remote");
     assert_eq!(transfers[1].get("size").unwrap().number(), 3);
+
+    // The summary says which way the content went.
+    let summary = events.last().unwrap();
+    assert_eq!(
+        summary.get("source").unwrap().text(),
+        sandbox.local.to_string_lossy(),
+    );
+    assert_eq!(
+        summary.get("destination").unwrap().text(),
+        sandbox.remote.to_string_lossy(),
+    );
 }
 
 #[test]
-fn a_conflict_emits_a_conflict_event() {
+fn a_deletion_is_planned_and_reported() {
     let sandbox = Sandbox::new();
-    sandbox.write(&sandbox.local, "doc.txt", "base");
-    let (code, _) = sandbox.json("sync", &["--auto"]);
-    assert_eq!(code, 0);
+    sandbox.write(&sandbox.local, "keep.txt", "same");
+    sandbox.write(&sandbox.remote, "keep.txt", "same");
+    sandbox.write(&sandbox.remote, "extra.txt", "only here");
 
-    sandbox.write(&sandbox.local, "doc.txt", "mine");
-    sandbox.write(&sandbox.remote, "doc.txt", "theirs");
-
-    let (code, events) = sandbox.json("sync", &["--auto"]);
-    assert_eq!(code, 3, "a conflict is not a failure");
-    let conflicts: Vec<&Object> = events
+    // The source does not have it, so the destination may not keep it.
+    let (code, events) = sandbox.json(&["--auto", "--delete"]);
+    assert_eq!(code, 0, "{events:?}");
+    let deletions: Vec<&Object> = events
         .iter()
-        .filter(|event| kind(event) == "conflict")
+        .filter(|event| kind(event) == "plan" && event.get("action").unwrap().text() == "delete")
         .collect();
-    assert_eq!(conflicts.len(), 1, "one conflict: {events:?}");
-    assert_eq!(conflicts[0].get("path").unwrap().text(), "doc.txt");
-    let copy = conflicts[0].get("copy").unwrap().text();
-    assert!(
-        copy.starts_with("doc.conflict-"),
-        "the copy must be named: {copy}"
-    );
+    assert_eq!(deletions.len(), 1, "one deletion: {events:?}");
+    assert_eq!(deletions[0].get("path").unwrap().text(), "extra.txt");
 }
 
 #[test]
@@ -262,10 +266,10 @@ fn a_skipped_file_emits_a_skip_event_with_a_reason() {
     let sandbox = Sandbox::new();
     sandbox.write(&sandbox.local, "keep.txt", "same");
     sandbox.write(&sandbox.remote, "keep.txt", "same");
-    sandbox.write(&sandbox.local, "extra.txt", "only here");
+    sandbox.write(&sandbox.remote, "extra.txt", "only here");
 
-    // A pull cannot remove what the source does not have.
-    let (code, events) = sandbox.json("pull", &["--auto"]);
+    // The source does not have it: the destination keeps it, and says so.
+    let (code, events) = sandbox.json(&["--auto"]);
     assert_eq!(code, 0);
     let skips: Vec<&Object> = events
         .iter()
@@ -287,7 +291,7 @@ fn the_summary_counts_match_the_text_report() {
         sandbox.write(&sandbox.local, "b.txt", "two");
     }
 
-    let (code, events) = json_run.json("sync", &["--auto"]);
+    let (code, events) = json_run.json(&["--auto"]);
     assert_eq!(code, 0);
     let summary = events.last().unwrap();
     assert_eq!(summary.get("created").unwrap().number(), 2);
@@ -295,14 +299,13 @@ fn the_summary_counts_match_the_text_report() {
     assert_eq!(summary.get("deleted").unwrap().number(), 0);
     assert_eq!(summary.get("failures").unwrap().number(), 0);
 
-    let (code, text, _) = text_run.run("sync", &["--auto"]);
+    let (code, text, _) = text_run.run(&["--auto"]);
     assert_eq!(code, 0);
     let expected = format!(
-        "created {}, updated {}, deleted {}, conflicts {}, skipped {}, failures {}",
+        "created {}, updated {}, deleted {}, skipped {}, failures {}",
         summary.get("created").unwrap().number(),
         summary.get("updated").unwrap().number(),
         summary.get("deleted").unwrap().number(),
-        summary.get("conflicts").unwrap().number(),
         summary.get("skipped").unwrap().number(),
         summary.get("failures").unwrap().number(),
     );
@@ -317,13 +320,13 @@ fn the_json_stream_replaces_the_human_report() {
     let sandbox = Sandbox::new();
     sandbox.write(&sandbox.local, "a.txt", "one");
 
-    let (_, output, _) = sandbox.run("sync", &["--auto", "--json"]);
+    let (_, output, _) = sandbox.run(&["--auto", "--json"]);
     assert!(
         !output.contains("created 1, updated 0"),
         "the human summary must not be printed as well: {output}"
     );
     assert!(
-        !output.contains("  create local -> remote"),
+        !output.contains("  create a.txt"),
         "the per-file text lines must not be printed as well: {output}"
     );
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
@@ -346,7 +349,7 @@ fn a_failure_is_reported_as_an_error_event() {
     permissions.set_mode(0o500);
     fs::set_permissions(&locked, permissions).unwrap();
 
-    let (code, events) = sandbox.json("sync", &["--auto"]);
+    let (code, events) = sandbox.json(&["--auto"]);
     if unsafe { libc::geteuid() } == 0 {
         // root ignores the mode: nothing to assert.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();

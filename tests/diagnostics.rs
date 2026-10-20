@@ -269,7 +269,7 @@ fn verbose_runs_leave_a_trail_and_quiet_ones_do_not() {
 
     let (code, _) = run(Command::new(binary())
         .args([
-            "push",
+            "sync",
             place.root.to_str().unwrap(),
             far.to_str().unwrap(),
             "--auto",
@@ -280,7 +280,7 @@ fn verbose_runs_leave_a_trail_and_quiet_ones_do_not() {
     // -vv turns on the diagnostic level
     let (code, output) = run(Command::new(binary())
         .args([
-            "push",
+            "sync",
             place.root.to_str().unwrap(),
             far.to_str().unwrap(),
             "-vv",
@@ -294,7 +294,7 @@ fn verbose_runs_leave_a_trail_and_quiet_ones_do_not() {
 
     // a plain run stays quiet on stderr
     let (code, output) = run(Command::new(binary())
-        .args(["push", place.root.to_str().unwrap(), far.to_str().unwrap()])
+        .args(["sync", place.root.to_str().unwrap(), far.to_str().unwrap()])
         .env("TWIN_DATA_DIR", &place.data));
     assert_eq!(code, 0);
     assert!(

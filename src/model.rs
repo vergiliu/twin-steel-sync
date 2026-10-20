@@ -41,62 +41,29 @@ pub struct Entry {
     pub mtime_ns: i64,
 }
 
-impl Entry {
-    pub fn is_file(&self) -> bool {
-        self.kind == Kind::File
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Local,
-    Remote,
-}
-
-impl Side {
-    pub fn other(self) -> Side {
-        match self {
-            Side::Local => Side::Remote,
-            Side::Remote => Side::Local,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Side::Local => "local",
-            Side::Remote => "remote",
-        }
-    }
-}
-
-/// Last state both sides agreed on, as stored in the archive.
+/// Which end of a run a path belongs to.
 ///
-/// Metadata is remembered per side: the same content can carry different mtimes
-/// on the two machines, and the fast path must match each side against its own
+/// A run has exactly two ends: the source, which is read, and the
+/// destination, which is written. The content always flows from the first to
+/// the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Source,
+    Destination,
+}
+
+/// Last state the two ends agreed on, as stored in the archive.
+///
+/// Metadata is remembered per end: the same content can carry different mtimes
+/// on the two sides, and the fast path must match each end against its own
 /// recorded value or every run would rewrite the archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseRow {
     pub kind: Kind,
     pub size: u64,
     pub hash: Hash,
-    pub mtime_local: i64,
-    pub mtime_remote: i64,
-}
-
-impl BaseRow {
-    pub fn mtime(&self, side: Side) -> i64 {
-        match side {
-            Side::Local => self.mtime_local,
-            Side::Remote => self.mtime_remote,
-        }
-    }
-
-    pub fn set_mtime(&mut self, side: Side, value: i64) {
-        match side {
-            Side::Local => self.mtime_local = value,
-            Side::Remote => self.mtime_remote = value,
-        }
-    }
+    pub mtime_source: i64,
+    pub mtime_destination: i64,
 }
 
 /// A failure that belongs to exactly one path. The run reports it, counts it
@@ -110,35 +77,22 @@ pub struct PathFailure {
 /// One unit of planned work. A run reports exactly these, dry or real.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// Put the source's content at the destination.
     Copy {
-        from: Side,
-        to: Side,
         path: PathBuf,
         size: u64,
         new_file: bool,
     },
+    /// The source does not have it and the destination must not keep it.
     Delete {
-        side: Side,
         path: PathBuf,
     },
-    Conflict {
-        path: PathBuf,
-        copy: PathBuf,
-        size: u64,
-    },
-    /// Both sides already agree; only the archive row is stale.
+    /// The two ends already agree; only the archive row is stale.
     Adopt {
         path: PathBuf,
         row: BaseRow,
     },
-    /// The other side deleted it and this one changed it: keep the change.
-    Resurrect {
-        from: Side,
-        to: Side,
-        path: PathBuf,
-        size: u64,
-    },
-    /// Both sides are gone: drop the remembered row.
+    /// Neither end has it any more: drop the remembered row.
     Forget {
         path: PathBuf,
     },
@@ -153,11 +107,9 @@ impl Action {
     pub fn path(&self) -> &Path {
         match self {
             Action::Copy { path, .. }
-            | Action::Delete { path, .. }
-            | Action::Conflict { path, .. }
+            | Action::Delete { path }
             | Action::Adopt { path, .. }
-            | Action::Resurrect { path, .. }
-            | Action::Forget { path, .. }
+            | Action::Forget { path }
             | Action::Skip { path, .. } => path,
         }
     }
@@ -171,9 +123,7 @@ impl Action {
                 new_file: false, ..
             } => "update",
             Action::Delete { .. } => "delete",
-            Action::Conflict { .. } => "conflict",
             Action::Skip { .. } => "skip",
-            Action::Resurrect { .. } => "resurrect",
             Action::Forget { .. } => "forget",
             Action::Adopt { .. } => "adopt",
         }
@@ -182,40 +132,17 @@ impl Action {
     pub fn describe(&self) -> String {
         match self {
             Action::Copy {
-                from,
-                to,
                 path,
                 size,
                 new_file,
             } => format!(
-                "{} {} -> {} :: {} ({} B)",
+                "{} {} ({} B)",
                 if *new_file { "create" } else { "update" },
-                from.name(),
-                to.name(),
                 path.display(),
                 size
             ),
-            Action::Delete { side, path } => {
-                format!("delete {} :: {}", side.name(), path.display())
-            }
-            Action::Conflict { path, copy, .. } => format!(
-                "conflict, keeping both: {} and {}",
-                path.display(),
-                copy.display()
-            ),
+            Action::Delete { path } => format!("delete {}", path.display()),
             Action::Adopt { path, .. } => format!("archive-only refresh of {}", path.display()),
-            Action::Resurrect {
-                from,
-                to,
-                path,
-                size,
-            } => format!(
-                "restore {} -> {} :: {} ({} B) — the other side had deleted it",
-                from.name(),
-                to.name(),
-                path.display(),
-                size
-            ),
             Action::Forget { path } => format!("forget {} (gone on both sides)", path.display()),
             Action::Skip { path, reason } => format!("skip {} ({})", path.display(), reason),
         }
@@ -245,10 +172,14 @@ pub fn cmp_path(a: &Path, b: &Path) -> Ordering {
     }
 }
 
-/// A path is considered unchanged when size and mtime agree with what this side
+/// A path is considered unchanged when size and mtime agree with what this end
 /// last agreed to. Hash equality is what actually decides; this is only a fast path.
-pub fn metadata_matches(entry: &Entry, base: &BaseRow, side: Side) -> bool {
-    entry.size == base.size && entry.mtime_ns == base.mtime(side) && entry.kind == base.kind
+pub fn metadata_matches(entry: &Entry, base: &BaseRow, role: Role) -> bool {
+    let mtime = match role {
+        Role::Source => base.mtime_source,
+        Role::Destination => base.mtime_destination,
+    };
+    entry.size == base.size && entry.mtime_ns == mtime && entry.kind == base.kind
 }
 
 #[cfg(test)]

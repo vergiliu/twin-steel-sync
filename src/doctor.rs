@@ -5,7 +5,7 @@
 //! the real operation and reports the real error.
 
 use crate::archive::Archive;
-use crate::fsutil::{probe_dir, ErrCtx};
+use crate::fsutil::probe_dir;
 use crate::remote::{RemoteBackend, RemoteOptions};
 use crate::side::Backend;
 use crate::tls;
@@ -360,13 +360,4 @@ pub fn report(checks: &[Check], out: &mut dyn Write) -> io::Result<usize> {
         writeln!(out, "{failures} problem(s) found")?;
     }
     Ok(failures)
-}
-
-/// Used by tests and by `serve` startup: does this directory support what a sync
-/// needs? Returns the human-readable problems, empty when all is well.
-pub fn root_problems(root: &Path) -> Vec<String> {
-    match fs::symlink_metadata(root).ctx(|| format!("stat {}", root.display())) {
-        Ok(_) => probe_dir(root).notes,
-        Err(error) => vec![error.to_string()],
-    }
 }

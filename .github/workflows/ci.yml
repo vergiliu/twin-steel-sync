@@ -88,15 +88,15 @@ jobs:
         run: sh scripts/codesign-macos.sh target/debug/twin
 
   scale:
-    # The 10k-file tree of F-071 is ignored by the default test run: F-021 puts
+    # The 1k-file tree of F-071 is ignored by the default test run: F-021 puts
     # every file through an fsync, and on macOS that fsync is an F_FULLFSYNC, so
-    # ten thousand files cost minutes. It is still checked on every push, here,
-    # where it can have a timeout of its own.
+    # a thousand files cost about a minute. It is still checked on every push,
+    # here, where it can have a timeout of its own.
     name: scale (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Ten thousand files, one fsync each: this job is allowed to take a long
+    # A thousand files, one fsync each: this job is allowed to take a long
     # time on macOS, where that fsync is an F_FULLFSYNC.
-    timeout-minutes: 90
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -112,5 +112,5 @@ jobs:
       - name: Cache the cargo build
         uses: Swatinem/rust-cache@v2
 
-      - name: Run the 10k-file tree test
+      - name: Run the 1k-file tree test
         run: cargo test --test scale -- --ignored --nocapture

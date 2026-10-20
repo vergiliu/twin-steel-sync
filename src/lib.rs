@@ -14,5 +14,5 @@ pub mod scan;
 pub mod side;
 pub mod tls;
 
-pub use engine::{run, run_tls, ExitCode, Mode, RunOptions, Summary};
+pub use engine::{run, End, ExitCode, RunOptions, Summary};
 pub use remote::RemoteOptions;

@@ -7,7 +7,7 @@
 
 use crate::engine::Summary;
 use crate::json::Object;
-use crate::model::{Action, Side};
+use crate::model::Action;
 use std::io::{self, Write};
 use std::path::{Component, Path};
 use std::time::Instant;
@@ -30,16 +30,26 @@ pub struct Reporter<'a> {
     json: bool,
     quiet: bool,
     verbose: bool,
+    /// Where the content comes from, and where it goes.
+    source: String,
+    destination: String,
     progress: Progress,
 }
 
 impl<'a> Reporter<'a> {
-    pub fn new(out: &'a mut dyn Write, opts: &crate::engine::RunOptions) -> Reporter<'a> {
+    pub fn new(
+        out: &'a mut dyn Write,
+        opts: &crate::engine::RunOptions,
+        source: &str,
+        destination: &str,
+    ) -> Reporter<'a> {
         Reporter {
             out,
             json: opts.json,
             quiet: opts.quiet,
             verbose: opts.verbose,
+            source: source.to_string(),
+            destination: destination.to_string(),
             progress: Progress::new(opts.tty, !opts.json && !opts.quiet),
         }
     }
@@ -67,7 +77,11 @@ impl<'a> Reporter<'a> {
                 writeln!(self.out, "{event}")?;
                 continue;
             }
-            if matches!(action, Action::Adopt { .. } | Action::Skip { .. }) && !self.verbose {
+            if matches!(
+                action,
+                Action::Adopt { .. } | Action::Forget { .. } | Action::Skip { .. }
+            ) && !self.verbose
+            {
                 continue;
             }
             writeln!(self.out, "  {}", action.describe())?;
@@ -75,27 +89,18 @@ impl<'a> Reporter<'a> {
         Ok(())
     }
 
-    /// The conflicts and the skips, as events of their own. In text they are
-    /// part of the plan and of the closing report.
-    pub fn conflict_and_skip_events(&mut self, actions: &[Action]) -> io::Result<()> {
+    /// The skips, as events of their own. In text they are part of the plan
+    /// and of the closing report.
+    pub fn skip_events(&mut self, actions: &[Action]) -> io::Result<()> {
         if !self.json {
             return Ok(());
         }
         for action in actions {
-            match action {
-                Action::Conflict { path, copy, .. } => {
-                    let mut object = Object::new("conflict");
-                    object.text("path", &relative(path));
-                    object.text("copy", &relative(copy));
-                    writeln!(self.out, "{}", object.finish())?;
-                }
-                Action::Skip { path, reason } => {
-                    let mut object = Object::new("skip");
-                    object.text("path", &relative(path));
-                    object.text("reason", reason);
-                    writeln!(self.out, "{}", object.finish())?;
-                }
-                _ => {}
+            if let Action::Skip { path, reason } = action {
+                let mut object = Object::new("skip");
+                object.text("path", &relative(path));
+                object.text("reason", reason);
+                writeln!(self.out, "{}", object.finish())?;
             }
         }
         Ok(())
@@ -120,15 +125,9 @@ impl<'a> Reporter<'a> {
     }
 
     /// A transfer is about to start.
-    pub fn transfer_start(
-        &mut self,
-        path: &Path,
-        from: Side,
-        to: Side,
-        size: u64,
-    ) -> io::Result<()> {
+    pub fn transfer_start(&mut self, path: &Path, size: u64) -> io::Result<()> {
         if self.json {
-            let event = transfer_event("start", path, from, to, size);
+            let event = transfer_event("start", path, size);
             writeln!(self.out, "{event}")?;
         }
         self.progress.file_start(path);
@@ -136,15 +135,9 @@ impl<'a> Reporter<'a> {
     }
 
     /// A transfer is done.
-    pub fn transfer_done(
-        &mut self,
-        path: &Path,
-        from: Side,
-        to: Side,
-        size: u64,
-    ) -> io::Result<()> {
+    pub fn transfer_done(&mut self, path: &Path, size: u64) -> io::Result<()> {
         if self.json {
-            let event = transfer_event("done", path, from, to, size);
+            let event = transfer_event("done", path, size);
             writeln!(self.out, "{event}")?;
         }
         self.progress.file_done(path, size);
@@ -196,10 +189,11 @@ impl<'a> Reporter<'a> {
             return Ok(());
         }
         let mut object = Object::new("summary");
+        object.text("source", &self.source);
+        object.text("destination", &self.destination);
         object.number("created", summary.created);
         object.number("updated", summary.updated);
         object.number("deleted", summary.deleted);
-        object.number("conflicts", summary.conflicts);
         object.number("skipped", summary.skipped);
         object.number("failures", summary.failures);
         object.number("unchanged", summary.unchanged);
@@ -214,21 +208,14 @@ impl<'a> Reporter<'a> {
         }
         writeln!(
             self.out,
-            "created {}, updated {}, deleted {}, conflicts {}, skipped {}, failures {}, unchanged {}",
+            "created {}, updated {}, deleted {}, skipped {}, failures {}, unchanged {}",
             summary.created,
             summary.updated,
             summary.deleted,
-            summary.conflicts,
             summary.skipped,
             summary.failures,
             summary.unchanged
         )?;
-        if summary.conflicts > 0 {
-            writeln!(
-                self.out,
-                "both versions were kept; look for files named *.conflict-*"
-            )?;
-        }
         Ok(())
     }
 
@@ -243,26 +230,16 @@ fn plan_event(action: &Action) -> String {
     let mut object = Object::new("plan");
     object.text("action", action.kind());
     object.text("path", &relative(action.path()));
-    match action {
-        Action::Copy { from, to, size, .. } | Action::Resurrect { from, to, size, .. } => {
-            object.text("from", from.name());
-            object.text("to", to.name());
-            object.number("size", *size);
-        }
-        Action::Conflict { size, .. } => {
-            object.number("size", *size);
-        }
-        _ => {}
+    if let Action::Copy { size, .. } = action {
+        object.number("size", *size);
     }
     object.finish()
 }
 
-fn transfer_event(phase: &str, path: &Path, from: Side, to: Side, size: u64) -> String {
+fn transfer_event(phase: &str, path: &Path, size: u64) -> String {
     let mut object = Object::new("transfer");
     object.text("phase", phase);
     object.text("path", &relative(path));
-    object.text("from", from.name());
-    object.text("to", to.name());
     object.number("size", size);
     object.finish()
 }

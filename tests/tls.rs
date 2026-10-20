@@ -140,13 +140,30 @@ impl Fixture {
         fs::write(path, contents).unwrap();
     }
 
-    fn sync(&self, server: &Server, verb: &str, extra: &[&str]) -> (i32, String) {
+    /// Copy the client's directory to the server: the local side is the
+    /// source, the server the destination.
+    fn local_to_server(&self, server: &Server, extra: &[&str]) -> (i32, String) {
         let spec = server.spec().to_string();
         let mut command = client(&self.client_data);
         command
-            .arg(verb)
+            .arg("sync")
             .arg(&self.local)
             .arg(&spec)
+            .arg("--pin")
+            .arg(&server.fingerprint)
+            .args(extra);
+        run(&mut command)
+    }
+
+    /// Copy the server's directory to the client: the server is the source,
+    /// the local side the destination.
+    fn server_to_local(&self, server: &Server, extra: &[&str]) -> (i32, String) {
+        let spec = server.spec().to_string();
+        let mut command = client(&self.client_data);
+        command
+            .arg("sync")
+            .arg(&spec)
+            .arg(&self.local)
             .arg("--pin")
             .arg(&server.fingerprint)
             .args(extra);
@@ -160,7 +177,7 @@ fn a_tree_travels_over_mutual_tls_and_settles() {
     fixture.write(&fixture.local, "notes/a.txt", "hello");
     fixture.write(&fixture.local, "deep/b.bin", "0123456789");
 
-    let (code, output) = fixture.sync(&server, "push", &["--auto", "--quiet"]);
+    let (code, output) = fixture.local_to_server(&server, &["--auto", "--quiet"]);
     assert_eq!(code, 0, "{output}");
     assert_eq!(
         fs::read_to_string(fixture.remote.join("notes/a.txt")).unwrap(),
@@ -179,7 +196,7 @@ fn a_tree_travels_over_mutual_tls_and_settles() {
         remote_meta.modified().unwrap()
     );
 
-    let (code, output) = fixture.sync(&server, "push", &[]);
+    let (code, output) = fixture.local_to_server(&server, &[]);
     assert_eq!(code, 0, "{output}");
     assert!(
         output.contains("created 0, updated 0, deleted 0"),
@@ -191,36 +208,56 @@ fn a_tree_travels_over_mutual_tls_and_settles() {
 fn the_pin_is_remembered_after_the_first_contact() {
     let (fixture, server) = Fixture::new();
     fixture.write(&fixture.local, "a.txt", "one");
-    let (code, output) = fixture.sync(&server, "push", &["--auto", "--quiet"]);
+    let (code, output) = fixture.local_to_server(&server, &["--auto", "--quiet"]);
     assert_eq!(code, 0, "{output}");
 
     // Same host:port, no --pin this time.
     let spec = server.spec().to_string();
     let (code, output) =
-        run(client(&fixture.client_data).args(["push", fixture.local.to_str().unwrap(), &spec]));
+        run(client(&fixture.client_data).args(["sync", fixture.local.to_str().unwrap(), &spec]));
     assert_eq!(code, 0, "the remembered pin should be enough: {output}");
 }
 
 #[test]
-fn content_changes_travel_both_ways() {
+fn the_source_always_wins_over_the_wire() {
     let (fixture, server) = Fixture::new();
     fixture.write(&fixture.local, "doc.txt", "v1");
-    fixture.sync(&server, "sync", &["--auto", "--quiet"]);
+    fixture.local_to_server(&server, &["--auto", "--quiet"]);
 
+    // A change on the source travels to the destination.
     fixture.write(&fixture.local, "doc.txt", "v2 local");
-    let (code, output) = fixture.sync(&server, "sync", &["--quiet"]);
+    let (code, output) = fixture.local_to_server(&server, &["--quiet"]);
     assert_eq!(code, 0, "{output}");
     assert_eq!(
         fs::read_to_string(fixture.remote.join("doc.txt")).unwrap(),
         "v2 local"
     );
 
+    // A change on the destination alone is not kept: the source still wins.
     fixture.write(&fixture.remote, "doc.txt", "v3 remote");
-    let (code, output) = fixture.sync(&server, "sync", &["--quiet"]);
+    let (code, output) = fixture.local_to_server(&server, &["--quiet"]);
+    assert_eq!(code, 0, "{output}");
+    assert_eq!(
+        fs::read_to_string(fixture.remote.join("doc.txt")).unwrap(),
+        "v2 local",
+        "the source's version must be put back in place"
+    );
+
+    // With the other direction the roles are exchanged, and the other side
+    // wins.
+    fixture.write(&fixture.remote, "doc.txt", "v3 remote");
+    // The other direction is another pair, so it needs its own consent.
+    let (code, output) = fixture.server_to_local(&server, &["--quiet", "--auto"]);
     assert_eq!(code, 0, "{output}");
     assert_eq!(
         fs::read_to_string(fixture.local.join("doc.txt")).unwrap(),
-        "v3 remote"
+        "v3 remote",
+        "the source is the server now, so its version wins"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.remote.join("doc.txt")).unwrap(),
+        "v3 remote",
+        "the source is never written to"
     );
 }
 
@@ -230,61 +267,55 @@ fn a_multi_chunk_file_survives_the_wire() {
     let payload: Vec<u8> = (0..1_200_000u32).map(|i| (i % 251) as u8).collect();
     fs::write(fixture.local.join("big.bin"), &payload).unwrap();
 
-    let (code, output) = fixture.sync(&server, "push", &["--auto", "--quiet"]);
+    let (code, output) = fixture.local_to_server(&server, &["--auto", "--quiet"]);
     assert_eq!(code, 0, "{output}");
     assert_eq!(fs::read(fixture.remote.join("big.bin")).unwrap(), payload);
 }
 
 #[test]
-fn deletions_propagate_over_the_wire() {
+fn a_file_deleted_on_the_source_stays_unless_asked_to_be_removed() {
     let (fixture, server) = Fixture::new();
     fixture.write(&fixture.local, "keep.txt", "keep");
     fixture.write(&fixture.local, "drop.txt", "drop");
-    fixture.sync(&server, "sync", &["--auto", "--quiet"]);
+    fixture.local_to_server(&server, &["--auto", "--quiet"]);
 
-    fs::remove_file(fixture.remote.join("drop.txt")).unwrap();
-    let (code, output) = fixture.sync(&server, "sync", &["--quiet"]);
+    fs::remove_file(fixture.local.join("drop.txt")).unwrap();
+    let (code, output) = fixture.local_to_server(&server, &["--quiet"]);
     assert_eq!(code, 0, "{output}");
     assert!(
-        !fixture.local.join("drop.txt").exists(),
-        "the deletion must travel"
+        fixture.remote.join("drop.txt").exists(),
+        "nothing is removed without --delete: {output}"
     );
+
+    let (code, output) = fixture.local_to_server(&server, &["--quiet", "--delete"]);
+    assert_eq!(code, 0, "{output}");
+    assert!(
+        !fixture.remote.join("drop.txt").exists(),
+        "--delete must remove what the source no longer has: {output}"
+    );
+    assert!(fixture.remote.join("keep.txt").exists());
 }
 
 #[test]
-fn conflicts_keep_both_versions_on_both_sides() {
+fn the_destination_never_keeps_a_version_of_its_own() {
     let (fixture, server) = Fixture::new();
     fixture.write(&fixture.local, "doc.txt", "base");
-    fixture.sync(&server, "sync", &["--auto", "--quiet"]);
+    fixture.local_to_server(&server, &["--auto", "--quiet"]);
 
     fixture.write(&fixture.local, "doc.txt", "mine");
     fixture.write(&fixture.remote, "doc.txt", "theirs");
 
-    let (code, output) = fixture.sync(&server, "sync", &["--auto"]);
-    assert_eq!(code, 3, "conflicts are reported, not fatal: {output}");
-
-    let names: Vec<String> = fs::read_dir(&fixture.local)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-        .collect();
-    let copy = names
-        .iter()
-        .find(|n| n.contains(".conflict-"))
-        .unwrap_or_else(|| panic!("no conflict copy in {names:?}"));
-
-    assert_eq!(
-        fs::read_to_string(fixture.local.join("doc.txt")).unwrap(),
-        "mine"
-    );
+    let (code, output) = fixture.local_to_server(&server, &["--auto"]);
+    assert_eq!(code, 0, "{output}");
     assert_eq!(
         fs::read_to_string(fixture.remote.join("doc.txt")).unwrap(),
         "mine",
-        "the local version wins the name on both sides"
+        "the source's version is the one that is kept"
     );
     assert_eq!(
-        fs::read_to_string(fixture.remote.join(copy)).unwrap(),
-        "theirs",
-        "the losing version is kept on both sides"
+        fs::read_to_string(fixture.local.join("doc.txt")).unwrap(),
+        "mine",
+        "the source is never written to"
     );
 }
 
@@ -300,7 +331,7 @@ fn a_client_that_was_never_authorized_is_refused() {
 
     let spec = server.spec().to_string();
     let (code, output) = run(client(&stranger_data)
-        .args(["push", fixture.local.to_str().unwrap(), &spec])
+        .args(["sync", fixture.local.to_str().unwrap(), &spec])
         .arg("--pin")
         .arg(&server.fingerprint)
         .arg("--auto"));
@@ -323,7 +354,7 @@ fn a_wrong_pin_is_refused_with_an_explanation() {
 
     let spec = server.spec().to_string();
     let (code, output) = run(client(&fixture.client_data)
-        .args(["push", fixture.local.to_str().unwrap(), &spec])
+        .args(["sync", fixture.local.to_str().unwrap(), &spec])
         .arg("--pin")
         .arg("ab".repeat(32))
         .arg("--auto"));
@@ -365,7 +396,7 @@ fn the_first_contact_needs_a_pin_rather_than_silent_trust() {
 
     let spec = server.spec().to_string();
     let (code, output) = run(client(&fixture.client_data)
-        .args(["push", fixture.local.to_str().unwrap(), &spec])
+        .args(["sync", fixture.local.to_str().unwrap(), &spec])
         .arg("--auto"));
 
     assert_eq!(code, 2, "it must ask for a pin: {output}");
@@ -376,17 +407,17 @@ fn the_first_contact_needs_a_pin_rather_than_silent_trust() {
     assert!(!fixture.remote.join("a.txt").exists());
 }
 
-/// The verb decides the direction, not the order of the arguments: `pull` must
-/// never push, whichever side is written first.
+/// The order of the arguments is the direction: the content flows from the
+/// first to the second, and the other side is left alone.
 #[test]
-fn pull_never_pushes_however_the_arguments_are_ordered() {
+fn the_order_of_the_arguments_decides_the_direction() {
     let (fixture, server) = Fixture::new();
     fixture.write(&fixture.remote, "doc.txt", "from the server");
     fixture.write(&fixture.local, "doc.txt", "from the laptop");
 
     let spec = server.spec().to_string();
     let (code, output) = run(client(&fixture.client_data)
-        .args(["pull", &spec, fixture.local.to_str().unwrap()])
+        .args(["sync", &spec, fixture.local.to_str().unwrap()])
         .arg("--pin")
         .arg(&server.fingerprint)
         .arg("--auto"));
@@ -395,12 +426,32 @@ fn pull_never_pushes_however_the_arguments_are_ordered() {
     assert_eq!(
         fs::read_to_string(fixture.local.join("doc.txt")).unwrap(),
         "from the server",
-        "pull must bring content down, not send it up"
+        "the first argument is the source: its content must arrive"
     );
     assert_eq!(
         fs::read_to_string(fixture.remote.join("doc.txt")).unwrap(),
         "from the server",
-        "the other side must be left alone"
+        "the source must be left alone"
+    );
+
+    // The other order copies the other way.
+    fixture.write(&fixture.local, "doc.txt", "from the laptop");
+    let (code, output) = run(client(&fixture.client_data)
+        .args(["sync", fixture.local.to_str().unwrap(), &spec])
+        .arg("--pin")
+        .arg(&server.fingerprint)
+        .arg("--auto"));
+
+    assert_eq!(code, 0, "{output}");
+    assert_eq!(
+        fs::read_to_string(fixture.remote.join("doc.txt")).unwrap(),
+        "from the laptop",
+        "the local side is the source now, so its content wins"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.local.join("doc.txt")).unwrap(),
+        "from the laptop",
+        "the source is never written to"
     );
 }
 
@@ -421,7 +472,7 @@ fn authorizing_a_client_takes_effect_without_restarting_the_server() {
 
     // Not authorized yet: refused.
     let (code, output) = run(client(&stranger_data)
-        .args(["push", stranger.to_str().unwrap(), server.spec()])
+        .args(["sync", stranger.to_str().unwrap(), server.spec()])
         .arg("--pin")
         .arg(&server.fingerprint)
         .arg("--auto"));
@@ -431,7 +482,7 @@ fn authorizing_a_client_takes_effect_without_restarting_the_server() {
     let (code, output) = run(client(&server_data).arg("authorize").arg(&stranger_fp));
     assert_eq!(code, 0, "{output}");
     let (code, output) = run(client(&stranger_data)
-        .args(["push", stranger.to_str().unwrap(), server.spec()])
+        .args(["sync", stranger.to_str().unwrap(), server.spec()])
         .arg("--pin")
         .arg(&server.fingerprint)
         .arg("--auto"));
@@ -453,7 +504,7 @@ fn authorizing_a_client_takes_effect_without_restarting_the_server() {
     fs::remove_file(fixture.remote.join("hello.txt")).unwrap();
 
     let (code, output) = run(client(&stranger_data)
-        .args(["push", stranger.to_str().unwrap(), server.spec()])
+        .args(["sync", stranger.to_str().unwrap(), server.spec()])
         .arg("--pin")
         .arg(&server.fingerprint)
         .arg("--auto"));
@@ -472,7 +523,7 @@ fn skipping_says_what_was_skipped_and_why() {
     fixture.write(&fixture.remote, "shared.txt", "same on both sides");
     fixture.write(&fixture.local, "local-only.txt", "never went anywhere");
 
-    let (code, output) = fixture.sync(&server, "pull", &["--auto"]);
+    let (code, output) = fixture.server_to_local(&server, &["--auto"]);
     assert_eq!(code, 0, "{output}");
     assert!(
         output.contains("absent on the source side"),

@@ -215,11 +215,11 @@ impl Fixture {
         fs::write(path, contents).unwrap();
     }
 
-    /// The command that pushes the client's root to the server.
-    pub fn push_command(&self, server: &Server) -> Command {
+    /// The command that copies the client's root to the server.
+    pub fn sync_command(&self, server: &Server) -> Command {
         let mut command = client(&self.client_data);
         command
-            .arg("push")
+            .arg("sync")
             .arg(&self.local)
             .arg(server.spec())
             .arg("--pin")

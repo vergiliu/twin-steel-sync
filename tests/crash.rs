@@ -174,7 +174,7 @@ fn a_killed_transfer_leaves_no_partial_file_and_the_next_run_converges() {
     );
 
     let mut child = fixture
-        .push_command(&server)
+        .sync_command(&server)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -272,25 +272,25 @@ fn a_killed_transfer_leaves_no_partial_file_and_the_next_run_converges() {
     }
 
     // The next run converges: the file travels again and lands whole.
-    let mut again = fixture.push_command(&server);
+    let mut again = fixture.sync_command(&server);
     let (code, output) = common::run(&mut again);
-    assert_eq!(code, 0, "the second push must succeed: {output}");
+    assert_eq!(code, 0, "the second sync must succeed: {output}");
     let counters = common::summary(&output);
     assert_eq!(
         counters.get("failures"),
         Some(&0),
-        "the second push must not fail on any file: {output}"
+        "the second sync must not fail on any file: {output}"
     );
     assert_eq!(
         counters.get("created").copied().unwrap_or(0)
             + counters.get("updated").copied().unwrap_or(0),
         1,
-        "the second push must transfer the file exactly once: {output}"
+        "the second sync must transfer the file exactly once: {output}"
     );
 
     assert!(
         delivered.exists(),
-        "the second push must deliver the file: {output}"
+        "the second sync must deliver the file: {output}"
     );
     assert_eq!(
         fs::metadata(&delivered).unwrap().len(),
@@ -313,7 +313,7 @@ fn a_killed_transfer_leaves_no_partial_file_and_the_next_run_converges() {
         assert_eq!(
             archive.integrity().unwrap(),
             "ok",
-            "the archive must still be sane after the second push"
+            "the archive must still be sane after the second sync"
         );
         let mut recorded: Vec<String> = Vec::new();
         archive

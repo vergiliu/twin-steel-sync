@@ -62,11 +62,13 @@ impl Pair {
         }
     }
 
-    fn pull(&self, extra: &[&str]) -> (i32, String) {
+    /// Copy the remote directory to the local one: the remote side is the
+    /// source, the local side the destination.
+    fn sync(&self, extra: &[&str]) -> (i32, String) {
         let output = Command::new(binary())
-            .arg("pull")
-            .arg(&self.local)
+            .arg("sync")
             .arg(&self.remote)
+            .arg(&self.local)
             .args(extra)
             .arg("--archive-dir")
             .arg(&self.archive)
@@ -88,7 +90,7 @@ fn an_interrupted_transfer_is_finished_by_the_next_run() {
     let partial = leftover(&pair.local, "big.bin");
     fs::write(&partial, &content[..40_000]).unwrap();
 
-    let (code, output) = pair.pull(&["--auto", "--quiet", "--partial"]);
+    let (code, output) = pair.sync(&["--auto", "--quiet", "--partial"]);
     assert_eq!(code, 0, "{output}");
     assert_eq!(
         fs::read(pair.local.join("big.bin")).unwrap(),
@@ -111,7 +113,7 @@ fn a_corrupted_partial_file_is_thrown_away_and_the_file_retransferred() {
     let partial = leftover(&pair.local, "big.bin");
     fs::write(&partial, b"this is not the beginning of the file").unwrap();
 
-    let (code, output) = pair.pull(&["--auto", "--quiet", "--partial"]);
+    let (code, output) = pair.sync(&["--auto", "--quiet", "--partial"]);
     assert_eq!(code, 0, "{output}");
     assert_eq!(
         fs::read(pair.local.join("big.bin")).unwrap(),
@@ -137,7 +139,7 @@ fn without_the_flag_the_leftover_is_replaced_rather_than_continued() {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&partial, fs::Permissions::from_mode(0o400)).unwrap();
 
-    let (code, output) = pair.pull(&["--auto", "--quiet", "--partial"]);
+    let (code, output) = pair.sync(&["--auto", "--quiet", "--partial"]);
     assert_eq!(
         code, 4,
         "the leftover must be continued, so it cannot be written to: {output}"
@@ -148,7 +150,7 @@ fn without_the_flag_the_leftover_is_replaced_rather_than_continued() {
     );
 
     // Without the flag the leftover is thrown away and the file is sent again.
-    let (code, output) = pair.pull(&["--auto", "--quiet"]);
+    let (code, output) = pair.sync(&["--auto", "--quiet"]);
     assert_eq!(code, 0, "{output}");
     assert_eq!(fs::read(pair.local.join("big.bin")).unwrap(), content);
 }
@@ -163,7 +165,7 @@ fn a_partial_file_that_is_too_long_is_thrown_away() {
     let partial = leftover(&pair.local, "small.bin");
     fs::write(&partial, vec![0u8; 50_000]).unwrap();
 
-    let (code, output) = pair.pull(&["--auto", "--quiet", "--partial"]);
+    let (code, output) = pair.sync(&["--auto", "--quiet", "--partial"]);
     assert_eq!(code, 0, "{output}");
     assert_eq!(fs::read(pair.local.join("small.bin")).unwrap(), content);
     assert!(!partial.exists());
@@ -257,9 +259,9 @@ fn an_interrupted_transfer_over_tls_is_finished_by_the_next_run() {
     fs::write(&partial, &content[..80_000]).unwrap();
 
     let (code, output) = run(client(&client_data)
-        .arg("pull")
-        .arg(&local)
+        .arg("sync")
         .arg(&server.addr)
+        .arg(&local)
         .arg("--pin")
         .arg(&server.fingerprint)
         .args(["--auto", "--quiet", "--partial"]));
@@ -298,9 +300,9 @@ fn a_killed_transfer_keeps_its_partial_file_and_the_next_run_resumes_it() {
     // The client is killed while the file is on its way.
     let mut child = Command::new(binary())
         .env("TWIN_DATA_DIR", &client_data)
-        .arg("pull")
-        .arg(&local)
+        .arg("sync")
         .arg(&server.addr)
+        .arg(&local)
         .arg("--pin")
         .arg(&server.fingerprint)
         .args(["--auto", "--quiet", "--partial"])
@@ -345,9 +347,9 @@ fn a_killed_transfer_keeps_its_partial_file_and_the_next_run_resumes_it() {
 
     // The next run finishes the file.
     let (code, output) = run(client(&client_data)
-        .arg("pull")
-        .arg(&local)
+        .arg("sync")
         .arg(&server.addr)
+        .arg(&local)
         .arg("--pin")
         .arg(&server.fingerprint)
         .args(["--auto", "--quiet", "--partial"]));
@@ -402,9 +404,9 @@ fn a_corrupted_partial_file_over_tls_is_thrown_away() {
     fs::write(&partial, b"not the beginning of this file at all").unwrap();
 
     let (code, output) = run(client(&client_data)
-        .arg("pull")
-        .arg(&local)
+        .arg("sync")
         .arg(&server.addr)
+        .arg(&local)
         .arg("--pin")
         .arg(&server.fingerprint)
         .args(["--auto", "--quiet", "--partial"]));

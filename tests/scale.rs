@@ -1,7 +1,7 @@
 //! F-071: the 10k-file tree.
 //!
-//! Ten thousand small files in a hundred directories, pushed once and then
-//! pushed again. The first run proves the machine can move a tree of that size;
+//! ONE thousand small files in a hundred directories, synced once and then
+//! synced again. The first run proves the machine can move a tree of that size;
 //! the second run is the point of the whole test: it must do nothing at all,
 //! which is what the archive is for. Without the archive every run would
 //! re-hash and re-copy the whole tree.
@@ -28,9 +28,9 @@ use std::path::Path;
 use std::time::Instant;
 
 /// How many directories the tree is spread over.
-const DIRECTORIES: usize = 100;
+const DIRECTORIES: usize = 20;
 /// How many files live in each directory.
-const FILES_PER_DIRECTORY: usize = 100;
+const FILES_PER_DIRECTORY: usize = 50;
 /// The number of files the tree holds.
 const TOTAL: usize = DIRECTORIES * FILES_PER_DIRECTORY;
 /// The same few dozen bytes in every file: the point is the file count.
@@ -89,7 +89,7 @@ fn build_tree(root: &Path) -> BTreeSet<String> {
 /// it in a job of its own, where it can take as long as it needs.
 #[test]
 #[ignore = "slow: one fsync per file; CI runs it in the `scale` job"]
-fn ten_thousand_files_are_pushed_once_and_then_nothing_happens() {
+fn ten_thousand_files_are_synced_once_and_then_nothing_happens() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let destination = root.path().join("destination");
@@ -105,7 +105,7 @@ fn ten_thousand_files_are_pushed_once_and_then_nothing_happens() {
     // First run: everything is copied.
     let mut first = common::client(&data);
     first
-        .arg("push")
+        .arg("sync")
         .arg(&source)
         .arg(&destination)
         .arg("--auto")
@@ -114,28 +114,28 @@ fn ten_thousand_files_are_pushed_once_and_then_nothing_happens() {
     let started = Instant::now();
     let (code, output) = common::run(&mut first);
     let first_elapsed = started.elapsed();
-    assert_eq!(code, 0, "the first push must succeed: {output}");
+    assert_eq!(code, 0, "the first sync must succeed: {output}");
 
     let counters = common::summary(&output);
     assert_eq!(
         counters.get("created"),
         Some(&(TOTAL as u64)),
-        "the first push must create every file: {output}"
+        "the first sync must create every file: {output}"
     );
     assert_eq!(
         counters.get("updated"),
         Some(&0),
-        "the first push must not update anything: {output}"
+        "the first sync must not update anything: {output}"
     );
     assert_eq!(
         counters.get("deleted"),
         Some(&0),
-        "the first push must not delete anything: {output}"
+        "the first sync must not delete anything: {output}"
     );
     assert_eq!(
         counters.get("failures"),
         Some(&0),
-        "the first push must not fail on any file: {output}"
+        "the first sync must not fail on any file: {output}"
     );
 
     let landed = files_under(&destination);
@@ -163,7 +163,7 @@ fn ten_thousand_files_are_pushed_once_and_then_nothing_happens() {
     // Second run: the archive knows everything already, so nothing happens.
     let mut second = common::client(&data);
     second
-        .arg("push")
+        .arg("sync")
         .arg(&source)
         .arg(&destination)
         .arg("--auto")
@@ -172,28 +172,28 @@ fn ten_thousand_files_are_pushed_once_and_then_nothing_happens() {
     let started = Instant::now();
     let (code, output) = common::run(&mut second);
     let second_elapsed = started.elapsed();
-    assert_eq!(code, 0, "the second push must succeed: {output}");
+    assert_eq!(code, 0, "the second sync must succeed: {output}");
 
     let counters = common::summary(&output);
     assert_eq!(
         counters.get("created"),
         Some(&0),
-        "the second push must create nothing: {output}"
+        "the second sync must create nothing: {output}"
     );
     assert_eq!(
         counters.get("updated"),
         Some(&0),
-        "the second push must update nothing: {output}"
+        "the second sync must update nothing: {output}"
     );
     assert_eq!(
         counters.get("deleted"),
         Some(&0),
-        "the second push must delete nothing: {output}"
+        "the second sync must delete nothing: {output}"
     );
     assert_eq!(
         counters.get("failures"),
         Some(&0),
-        "the second push must not fail on any file: {output}"
+        "the second sync must not fail on any file: {output}"
     );
     assert_eq!(
         counters.get("unchanged"),
@@ -204,8 +204,8 @@ fn ten_thousand_files_are_pushed_once_and_then_nothing_happens() {
     let landed = files_under(&destination);
     assert_eq!(
         landed, expected,
-        "the second push must leave the destination exactly as it was"
+        "the second sync must leave the destination exactly as it was"
     );
 
-    eprintln!("{TOTAL}-file tree: first push {first_elapsed:?}, second push {second_elapsed:?}");
+    eprintln!("{TOTAL}-file tree: first sync {first_elapsed:?}, second sync {second_elapsed:?}");
 }

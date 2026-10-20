@@ -1,13 +1,13 @@
 //! Keeps the version that is about to be replaced or removed.
 //!
-//! The backup lands on the client, whatever direction the transfer runs in: the
-//! far side may be another machine, so the old version has to be fetched
-//! before it is overwritten. The layout under the backup directory mirrors the
-//! path under the synced root, and the file name carries a timestamp, so a
-//! backup is never silently overwritten either.
+//! The backup lands on the client, whatever the transfer runs in: the far side
+//! may be another machine, so the old version has to be fetched before it is
+//! overwritten. The layout under the backup directory mirrors the path under
+//! the synced root, and the file name carries a timestamp, so a backup is
+//! never silently overwritten either.
 
 use crate::fsutil::ErrCtx;
-use crate::model::{Kind, Side};
+use crate::model::Kind;
 use crate::side::Backend;
 use std::fs;
 use std::io;
@@ -44,17 +44,12 @@ pub fn unique_path(candidate: &Path) -> PathBuf {
 /// Returns the path of the backup, or `None` when there is nothing to keep:
 /// a file that does not exist yet, or one the engine skips anyway.
 pub fn take(
-    side: Side,
+    backend: &mut dyn Backend,
     rel: &Path,
-    local: &mut dyn Backend,
-    remote: &mut dyn Backend,
     backup_dir: &Path,
     stamp: &str,
 ) -> io::Result<Option<PathBuf>> {
-    match side {
-        Side::Local => take_from(local, rel, backup_dir, stamp),
-        Side::Remote => take_from(remote, rel, backup_dir, stamp),
-    }
+    take_from(backend, rel, backup_dir, stamp)
 }
 
 /// Keep the version one side holds at `rel`.

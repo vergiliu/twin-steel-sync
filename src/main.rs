@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use twin::engine::{run, run_tls, Mode, RunOptions};
+use twin::engine::{End, RunOptions};
 use twin::remote::RemoteOptions;
 use twin::tls;
 
@@ -10,7 +10,7 @@ use twin::tls;
 #[command(
     name = "twin",
     version,
-    about = "Make two directories equal. One side is local; the other is a local path, or a host:port served over mutual TLS."
+    about = "Copy a directory to another one: a local path, or a host:port served over mutual TLS."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -19,16 +19,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Two-way: both sides converge, conflicts keep both versions
+    /// Copy the source to the destination. The source always wins.
     Sync(PairArgs),
-    /// One-way: copy the local directory to the other side
-    Push(PairArgs),
-    /// One-way: copy the other side into the local directory
-    Pull(PairArgs),
-    /// Compare by content and report differences; writes nothing.
-    /// Exits 0 when the two sides agree and 3 when they differ — unlike
-    /// --dry-run, which always exits 0.
-    Verify(PairArgs),
     /// Show this machine's fingerprint, creating its key on first use
     Id,
     /// Let a client fingerprint connect to this machine's server
@@ -69,13 +61,13 @@ struct ServeArgs {
 
 #[derive(Args)]
 struct PairArgs {
-    /// Local directory, or the host:port of a `twin serve`
-    left: String,
-    /// Local directory, or the host:port of a `twin serve`
-    right: String,
+    /// Where the content comes from: a directory, or the host:port of a `twin serve`
+    source: String,
+    /// Where the content goes: a directory, or the host:port of a `twin serve`
+    destination: String,
     #[arg(long)]
     dry_run: bool,
-    /// One-way only: remove paths the source does not have
+    /// Remove the paths the source does not have
     #[arg(long)]
     delete: bool,
     /// Override the mass-delete guard
@@ -116,37 +108,25 @@ struct PairArgs {
     quiet: bool,
 }
 
-enum Spec {
-    Local(PathBuf),
-    Remote(RemoteOptions),
-}
-
-enum Target {
-    Local(PathBuf),
-    Remote(RemoteOptions),
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
     twin::log::set_level_from_env();
 
     match cli.command {
-        Command::Id => return print_id(),
-        Command::Authorize { fingerprint } => return authorize(&fingerprint),
-        Command::Serve(args) => return serve(&args),
-        Command::Doctor(args) => return doctor(&args),
-        _ => {}
+        Command::Id => print_id(),
+        Command::Authorize { fingerprint } => authorize(&fingerprint),
+        Command::Serve(args) => serve(&args),
+        Command::Doctor(args) => doctor(&args),
+        Command::Sync(args) => sync(args),
     }
+}
 
-    let (args, mode, is_verify) = match cli.command {
-        Command::Sync(args) => (args, Mode::Sync, false),
-        Command::Push(args) => (args, Mode::Push, false),
-        Command::Pull(args) => (args, Mode::Pull, false),
-        Command::Verify(args) => (args, Mode::Sync, true),
-        _ => unreachable!("handled above"),
-    };
-
+/// Copy the source to the destination.
+///
+/// The order of the two arguments is the direction of the copy: the content
+/// flows from the first to the second, and only the second is written.
+fn sync(args: PairArgs) -> ExitCode {
     if args.verbose > 0 {
         twin::log::set_level(if args.verbose > 1 {
             twin::log::DEBUG
@@ -155,14 +135,14 @@ fn main() -> ExitCode {
         });
     }
 
-    let mut left = match parse_spec(&args.left) {
+    let source = match parse_spec(&args.source) {
         Ok(spec) => spec,
         Err(message) => {
             eprintln!("error: {message}");
             return ExitCode::from(2);
         }
     };
-    let mut right = match parse_spec(&args.right) {
+    let destination = match parse_spec(&args.destination) {
         Ok(spec) => spec,
         Err(message) => {
             eprintln!("error: {message}");
@@ -170,27 +150,16 @@ fn main() -> ExitCode {
         }
     };
 
-    // The local side is whatever is not remote. Which argument came first only
-    // says which side is which: `push` always means local -> other, `pull` always
-    // means other -> local, whatever the order on the command line.
-    if matches!(left, Spec::Remote(_)) && matches!(right, Spec::Local(_)) {
-        std::mem::swap(&mut left, &mut right);
+    if source.is_remote() && destination.is_remote() {
+        eprintln!("error: one side must be a directory on this machine; both look like addresses");
+        return ExitCode::from(2);
     }
 
-    let (local_root, target) = match (left, right) {
-        (Spec::Local(root), Spec::Local(other)) => (root, Target::Local(other)),
-        (Spec::Local(root), Spec::Remote(remote)) => (root, Target::Remote(remote)),
-        (Spec::Remote(_), Spec::Remote(_)) => {
-            eprintln!("error: one side must be local; both look like addresses");
-            return ExitCode::from(2);
-        }
-        (Spec::Remote(_), Spec::Local(_)) => unreachable!("swapped above"),
-    };
-
     // A remote needs a pinned certificate: explicit on first contact, remembered after.
-    let pin = match &target {
-        Target::Local(_) => None,
-        Target::Remote(remote) => match resolve_pin(remote, args.pin.as_deref()) {
+    let remote = source.remote().or_else(|| destination.remote());
+    let pin = match remote {
+        None => None,
+        Some(remote) => match resolve_pin(remote, args.pin.as_deref()) {
             Ok(pin) => Some(pin),
             Err(message) => {
                 eprintln!("error: {message}");
@@ -200,12 +169,11 @@ fn main() -> ExitCode {
     };
 
     let mut options = RunOptions {
-        mode,
-        dry_run: args.dry_run || is_verify,
+        dry_run: args.dry_run,
         delete: args.delete,
         force: args.force,
         auto: args.auto,
-        checksum: args.checksum || is_verify,
+        checksum: args.checksum,
         fast: args.fast,
         default_ignores: !args.no_default_ignores,
         excludes: args.excludes,
@@ -224,7 +192,8 @@ fn main() -> ExitCode {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    let summary = match run_target(&local_root, &target, pin.as_deref(), &options, &mut out) {
+    let summary = match twin::engine::run(&source, &destination, pin.as_deref(), &options, &mut out)
+    {
         Ok(summary) => summary,
         Err(error) => {
             eprintln!("error: {error}");
@@ -233,7 +202,7 @@ fn main() -> ExitCode {
     };
 
     // A pin that worked is remembered, so the next run needs no flags.
-    if let (Target::Remote(remote), Some(pin)) = (&target, &pin) {
+    if let (Some(remote), Some(pin)) = (remote, &pin) {
         if let Err(error) = tls::write_pin(&tls::data_dir(), &remote.host, remote.port, pin) {
             eprintln!("warning: could not remember the pin: {error}");
         }
@@ -247,10 +216,8 @@ fn main() -> ExitCode {
         match ask_to_proceed() {
             Ok(true) => {
                 options.auto = true;
-                match run_target(&local_root, &target, pin.as_deref(), &options, &mut out) {
-                    Ok(summary) => {
-                        return exit_for(&summary, is_verify, options.dry_run, options.json)
-                    }
+                match twin::engine::run(&source, &destination, pin.as_deref(), &options, &mut out) {
+                    Ok(summary) => return exit_for(&summary, options.dry_run),
                     Err(error) => {
                         eprintln!("error: {error}");
                         return ExitCode::from(1);
@@ -272,23 +239,7 @@ fn main() -> ExitCode {
         }
     }
 
-    exit_for(&summary, is_verify, options.dry_run, options.json)
-}
-
-fn run_target(
-    local_root: &Path,
-    target: &Target,
-    pin: Option<&str>,
-    options: &RunOptions,
-    out: &mut dyn Write,
-) -> io::Result<twin::Summary> {
-    match target {
-        Target::Local(other) => run(local_root, other, options, out),
-        Target::Remote(remote) => {
-            let pin = pin.expect("a remote target always has a pin by the time it is used");
-            run_tls(local_root, remote, pin, options, out)
-        }
-    }
+    exit_for(&summary, options.dry_run)
 }
 
 fn resolve_pin(remote: &RemoteOptions, given: Option<&str>) -> Result<String, String> {
@@ -305,11 +256,9 @@ fn resolve_pin(remote: &RemoteOptions, given: Option<&str>) -> Result<String, St
     match tls::read_pin(&tls::data_dir(), &remote.host, remote.port) {
         Ok(Some(pin)) => Ok(pin),
         Ok(None) => Err(format!(
-            "no pinned certificate for {} yet.\n\
+            "no pinned certificate for {label} yet.\n\
              On the server run `twin id` and pass what it prints:\n  \
-             twin <verb> {local} {label} --pin <fingerprint>",
-            remote.label(),
-            local = "<local dir>",
+             twin sync <source> {label} --pin <fingerprint>",
             label = remote.label()
         )),
         Err(error) => Err(format!("cannot read the pinned certificates: {error}")),
@@ -397,8 +346,8 @@ fn doctor(args: &DoctorArgs) -> ExitCode {
 
     if let Some(spec) = &args.remote {
         let remote = match parse_spec(spec) {
-            Ok(Spec::Remote(remote)) => remote,
-            Ok(Spec::Local(_)) => {
+            Ok(End::Remote(remote)) => remote,
+            Ok(End::Local(_)) => {
                 eprintln!("error: {spec} is a local path; --remote wants host:port");
                 return ExitCode::from(2);
             }
@@ -431,38 +380,23 @@ fn doctor(args: &DoctorArgs) -> ExitCode {
     }
 }
 
-fn exit_for(summary: &twin::Summary, is_verify: bool, dry_run: bool, json: bool) -> ExitCode {
-    if is_verify {
-        // `twin verify` keeps its own contract: 0 when the two sides agree, 3
-        // when they differ. A dry run of the other verbs exits 0 instead.
-        let differences = summary.created + summary.updated + summary.deleted + summary.conflicts;
-        if differences > 0 {
-            if !json {
-                println!("{differences} paths differ");
-            }
-            return ExitCode::from(3);
-        }
-        if !json {
-            println!("in sync");
-        }
-        return ExitCode::from(0);
-    }
+fn exit_for(summary: &twin::Summary, dry_run: bool) -> ExitCode {
     if dry_run {
         // A dry run is a report, not a decision: it succeeds even when the
-        // plan holds conflicts. Files that failed are still failures.
+        // plan holds deletions. Files that failed are still failures.
         return ExitCode::from(if summary.failures > 0 { 4 } else { 0 });
     }
     ExitCode::from(summary.exit_code().code() as u8)
 }
 
-fn parse_spec(spec: &str) -> Result<Spec, String> {
+fn parse_spec(spec: &str) -> Result<End, String> {
     if Path::new(spec).exists() {
-        return Ok(Spec::Local(PathBuf::from(spec)));
+        return Ok(End::Local(PathBuf::from(spec)));
     }
     if let Some((host, port)) = spec.rsplit_once(':') {
         if let Ok(port) = port.parse::<u16>() {
             if !host.is_empty() {
-                return Ok(Spec::Remote(RemoteOptions {
+                return Ok(End::Remote(RemoteOptions {
                     host: host.to_string(),
                     port,
                 }));

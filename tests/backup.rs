@@ -14,24 +14,24 @@ fn twin() -> PathBuf {
 
 struct Sandbox {
     _root: tempfile::TempDir,
-    local: PathBuf,
-    remote: PathBuf,
+    source: PathBuf,
+    destination: PathBuf,
     archive: PathBuf,
 }
 
 impl Sandbox {
     fn new() -> Sandbox {
         let root = tempfile::tempdir().unwrap();
-        let local = root.path().join("local");
-        let remote = root.path().join("remote");
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
         let archive = root.path().join("archive");
-        for dir in [&local, &remote, &archive] {
+        for dir in [&source, &destination, &archive] {
             fs::create_dir_all(dir).unwrap();
         }
         Sandbox {
             _root: root,
-            local,
-            remote,
+            source,
+            destination,
             archive,
         }
     }
@@ -48,23 +48,37 @@ impl Sandbox {
         (output.status.code().unwrap_or(-1), text)
     }
 
-    /// A first run, so both sides know each other.
+    /// A first run, so the two sides know each other.
     fn settle(&self) {
         let (code, output) = self.run(&[
             "sync",
-            self.local.to_str().unwrap(),
-            self.remote.to_str().unwrap(),
+            self.source.to_str().unwrap(),
+            self.destination.to_str().unwrap(),
             "--auto",
             "--quiet",
         ]);
         assert_eq!(code, 0, "{output}");
     }
 
+    /// Copy the source to the destination, keeping what is replaced.
     fn sync_with_backup(&self, backup: &Path) -> (i32, String) {
         self.run(&[
             "sync",
-            self.local.to_str().unwrap(),
-            self.remote.to_str().unwrap(),
+            self.source.to_str().unwrap(),
+            self.destination.to_str().unwrap(),
+            "--auto",
+            "--quiet",
+            "--backup",
+            backup.to_str().unwrap(),
+        ])
+    }
+
+    /// Copy the destination to the source, keeping what is replaced.
+    fn sync_back_with_backup(&self, backup: &Path) -> (i32, String) {
+        self.run(&[
+            "sync",
+            self.destination.to_str().unwrap(),
+            self.source.to_str().unwrap(),
             "--auto",
             "--quiet",
             "--backup",
@@ -102,13 +116,13 @@ fn files_below(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn a_file_overwritten_on_the_remote_side_is_backed_up() {
+fn a_file_overwritten_on_the_destination_is_backed_up() {
     let sandbox = Sandbox::new();
-    sandbox.write(&sandbox.local, "doc.txt", "base");
+    sandbox.write(&sandbox.source, "doc.txt", "base");
     sandbox.settle();
 
-    // The local file changes, so the remote one is about to be replaced.
-    sandbox.write(&sandbox.local, "doc.txt", "new local");
+    // The source file changes, so the destination one is about to be replaced.
+    sandbox.write(&sandbox.source, "doc.txt", "new source");
     let backup = sandbox._root.path().join("backup");
     let (code, output) = sandbox.sync_with_backup(&backup);
     assert_eq!(code, 0, "{output}");
@@ -131,21 +145,22 @@ fn a_file_overwritten_on_the_remote_side_is_backed_up() {
         backups[0]
     );
     assert_eq!(
-        fs::read_to_string(sandbox.remote.join("doc.txt")).unwrap(),
-        "new local"
+        fs::read_to_string(sandbox.destination.join("doc.txt")).unwrap(),
+        "new source"
     );
 }
 
 #[test]
 fn a_file_overwritten_on_the_local_side_is_backed_up() {
     let sandbox = Sandbox::new();
-    sandbox.write(&sandbox.local, "doc.txt", "base");
+    sandbox.write(&sandbox.source, "doc.txt", "base");
     sandbox.settle();
 
-    // The remote file changes, so the local one is about to be replaced.
-    sandbox.write(&sandbox.remote, "doc.txt", "new remote");
+    // The other way round the local side is the destination, so the local file
+    // is the one that is replaced.
+    sandbox.write(&sandbox.destination, "doc.txt", "new destination");
     let backup = sandbox._root.path().join("backup");
-    let (code, output) = sandbox.sync_with_backup(&backup);
+    let (code, output) = sandbox.sync_back_with_backup(&backup);
     assert_eq!(code, 0, "{output}");
 
     let backups = files_below(&backup);
@@ -156,28 +171,38 @@ fn a_file_overwritten_on_the_local_side_is_backed_up() {
         "the backup must hold the version that was replaced"
     );
     assert_eq!(
-        fs::read_to_string(sandbox.local.join("doc.txt")).unwrap(),
-        "new remote"
+        fs::read_to_string(sandbox.source.join("doc.txt")).unwrap(),
+        "new destination"
     );
 }
 
 #[test]
 fn a_deleted_file_is_backed_up() {
     let sandbox = Sandbox::new();
-    sandbox.write(&sandbox.local, "gone.txt", "still here");
-    sandbox.write(&sandbox.local, "kept.txt", "kept");
+    sandbox.write(&sandbox.source, "gone.txt", "still here");
+    sandbox.write(&sandbox.source, "kept.txt", "kept");
     sandbox.settle();
 
-    fs::remove_file(sandbox.remote.join("gone.txt")).unwrap();
+    // The source no longer has it, and the destination is asked to give it up.
+    fs::remove_file(sandbox.source.join("gone.txt")).unwrap();
     let backup = sandbox._root.path().join("backup");
-    let (code, output) = sandbox.sync_with_backup(&backup);
+    let (code, output) = sandbox.run(&[
+        "sync",
+        sandbox.source.to_str().unwrap(),
+        sandbox.destination.to_str().unwrap(),
+        "--auto",
+        "--quiet",
+        "--delete",
+        "--backup",
+        backup.to_str().unwrap(),
+    ]);
     assert_eq!(code, 0, "{output}");
 
     let backups = files_below(&backup);
     assert_eq!(backups.len(), 1, "one backup expected: {backups:?}");
     assert_eq!(fs::read_to_string(&backups[0]).unwrap(), "still here");
     assert!(
-        !sandbox.local.join("gone.txt").exists(),
+        !sandbox.destination.join("gone.txt").exists(),
         "the file must still be deleted"
     );
 }
@@ -185,10 +210,10 @@ fn a_deleted_file_is_backed_up() {
 #[test]
 fn the_backup_keeps_the_path_under_the_backup_directory() {
     let sandbox = Sandbox::new();
-    sandbox.write(&sandbox.local, "deep/inside/notes.txt", "base");
+    sandbox.write(&sandbox.source, "deep/inside/notes.txt", "base");
     sandbox.settle();
 
-    sandbox.write(&sandbox.local, "deep/inside/notes.txt", "new");
+    sandbox.write(&sandbox.source, "deep/inside/notes.txt", "new");
     let backup = sandbox._root.path().join("backup");
     let (code, output) = sandbox.sync_with_backup(&backup);
     assert_eq!(code, 0, "{output}");
@@ -206,25 +231,25 @@ fn the_backup_keeps_the_path_under_the_backup_directory() {
 #[test]
 fn the_backup_directory_is_never_synced() {
     let sandbox = Sandbox::new();
-    sandbox.write(&sandbox.local, "doc.txt", "base");
+    sandbox.write(&sandbox.source, "doc.txt", "base");
     sandbox.settle();
 
-    // The backup directory sits inside the synced root: what it holds must
-    // not travel to the other side, or the next run would back up the
+    // The backup directory sits inside the destination: what it holds must
+    // not travel back to the source, or the next run would back up the
     // backups.
-    let backup = sandbox.local.join("backups");
-    sandbox.write(&sandbox.local, "doc.txt", "new");
+    let backup = sandbox.destination.join("backups");
+    sandbox.write(&sandbox.source, "doc.txt", "new");
     let (code, output) = sandbox.sync_with_backup(&backup);
     assert_eq!(code, 0, "{output}");
 
     assert!(!files_below(&backup).is_empty(), "the backup must exist");
     assert!(
-        !sandbox.remote.join("backups").exists(),
+        !sandbox.source.join("backups").exists(),
         "the backup directory must not travel: {:?}",
-        files_below(&sandbox.remote)
+        files_below(&sandbox.source)
     );
     assert_eq!(
-        files_below(&sandbox.remote).len(),
+        files_below(&sandbox.source).len(),
         1,
         "only the synced file may be on the other side"
     );
@@ -233,15 +258,15 @@ fn the_backup_directory_is_never_synced() {
 #[test]
 fn a_dry_run_writes_no_backup() {
     let sandbox = Sandbox::new();
-    sandbox.write(&sandbox.local, "doc.txt", "base");
+    sandbox.write(&sandbox.source, "doc.txt", "base");
     sandbox.settle();
-    sandbox.write(&sandbox.local, "doc.txt", "new");
+    sandbox.write(&sandbox.source, "doc.txt", "new");
 
     let backup = sandbox._root.path().join("backup");
     let (code, output) = sandbox.run(&[
         "sync",
-        sandbox.local.to_str().unwrap(),
-        sandbox.remote.to_str().unwrap(),
+        sandbox.source.to_str().unwrap(),
+        sandbox.destination.to_str().unwrap(),
         "--auto",
         "--dry-run",
         "--backup",
@@ -254,7 +279,7 @@ fn a_dry_run_writes_no_backup() {
         files_below(&backup)
     );
     assert_eq!(
-        fs::read_to_string(sandbox.remote.join("doc.txt")).unwrap(),
+        fs::read_to_string(sandbox.destination.join("doc.txt")).unwrap(),
         "base",
         "the dry run must not have replaced anything"
     );
@@ -263,14 +288,14 @@ fn a_dry_run_writes_no_backup() {
 #[test]
 fn a_backup_is_never_overwritten() {
     let sandbox = Sandbox::new();
-    sandbox.write(&sandbox.local, "doc.txt", "base");
+    sandbox.write(&sandbox.source, "doc.txt", "base");
     sandbox.settle();
     let backup = sandbox._root.path().join("backup");
 
     // Three changes in the same second: the timestamps collide, so the
     // backups need a counter.
     for round in 0..3 {
-        sandbox.write(&sandbox.local, "doc.txt", &format!("round {round}"));
+        sandbox.write(&sandbox.source, "doc.txt", &format!("round {round}"));
         let (code, output) = sandbox.sync_with_backup(&backup);
         assert_eq!(code, 0, "{output}");
     }

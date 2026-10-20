@@ -34,7 +34,7 @@ fmt: ## Format the sources
 
 check: fmt lint test sign ## Format, lint, test, then sign whatever was produced
 
-scale: ## The 10k-file tree test (slow: one fsync per file)
+scale: ## The 1k-file tree test (slow: one fsync per file)
 	$(CARGO) test --test scale -- --ignored --nocapture
 
 sign: ## Sign whatever binaries already exist (macOS)

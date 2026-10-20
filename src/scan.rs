@@ -38,11 +38,6 @@ pub fn patterns_for(root: &Path, extra_excludes: &[String]) -> io::Result<Vec<St
 }
 
 impl IgnoreRules {
-    pub fn load(root: &Path, defaults: bool, extra_excludes: &[String]) -> io::Result<Self> {
-        let patterns = patterns_for(root, extra_excludes)?;
-        Self::from_patterns(root, defaults, &patterns)
-    }
-
     /// Same rules on both sides: the client sends exactly these patterns to the
     /// far end rather than letting each machine read its own `.twinignore`.
     pub fn from_patterns(root: &Path, defaults: bool, patterns: &[String]) -> io::Result<Self> {
@@ -245,7 +240,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn scan(root: &Path, defaults: bool, excludes: &[String]) -> Vec<String> {
-        let rules = IgnoreRules::load(root, defaults, excludes).unwrap();
+        let patterns = patterns_for(root, excludes).unwrap();
+        let rules = IgnoreRules::from_patterns(root, defaults, &patterns).unwrap();
         let mut scanner = Scanner::new(root, rules).unwrap();
         let mut out = Vec::new();
         while let Some(entry) = scanner.next_entry() {
