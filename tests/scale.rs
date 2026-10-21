@@ -1,12 +1,16 @@
-//! F-071: the 10k-file tree.
+//! F-071: the 1k-file tree.
 //!
-//! ONE thousand small files in a hundred directories, synced once and then
-//! synced again. The first run proves the machine can move a tree of that size;
-//! the second run is the point of the whole test: it must do nothing at all,
+//! One thousand small files in twenty directories, synced once and then synced
+//! again. The first run proves the machine can move a tree of that size; the
+//! second run is the point of the whole test: it must do nothing at all,
 //! which is what the archive is for. Without the archive every run would
 //! re-hash and re-copy the whole tree.
 //!
-//! Why ten thousand: the shape of the test is a tree, a directory walk and an
+//! The second test measures the startup of a run — the plan, before anything
+//! moves — on a tree that is already in sync, which is where the plan has to
+//! decide that there is nothing to do.
+//!
+//! Why a thousand: the shape of the test is a tree, a directory walk and an
 //! archive with a row per file, and the point of the size is that anything
 //! accidentally quadratic (an archive lookup per path, a plan that re-scans
 //! what it has already seen) shows up here and nowhere else.
@@ -14,11 +18,13 @@
 //! Runtime: the first run is dominated by one fsync per file (F-021 puts every
 //! file through a temp file, an fsync and a rename), so expect tens of seconds
 //! on a slow disk and more on macOS, where the fsync is an `F_FULLFSYNC` —
-//! about nine minutes for ten thousand files on an M-series laptop. The second
-//! run only reads metadata and hashes, so it is seconds at worst. There is
-//! deliberately no wall-clock assertion: CI machines vary far too much for a
-//! time bound to be honest, and a flaky test is worse than no test. The
-//! elapsed time of both runs is printed instead, so a human can read it.
+//! tens of seconds for a thousand files. The directories are fsynced once when
+//! the run ends, not once per file, and `--fsync off` takes the barriers away
+//! altogether. The second run only reads metadata and hashes, so it is
+//! seconds at worst. There is deliberately no wall-clock assertion: CI
+//! machines vary far too much for a time bound to be honest, and a flaky test
+//! is worse than no test. The elapsed time of both runs is printed instead,
+//! so a human can read it.
 
 mod common;
 
@@ -83,7 +89,7 @@ fn build_tree(root: &Path) -> BTreeSet<String> {
     expected
 }
 
-/// Ten thousand files cost about nine minutes on macOS (F-021 puts every file
+/// A thousand files cost tens of seconds on macOS (F-021 puts every file
 /// through a temp file, an fsync and a rename, and on macOS that fsync is an
 /// `F_FULLFSYNC`), so the test is ignored by default and the CI workflow runs
 /// it in a job of its own, where it can take as long as it needs.
@@ -208,4 +214,61 @@ fn ten_thousand_files_are_synced_once_and_then_nothing_happens() {
     );
 
     eprintln!("{TOTAL}-file tree: first sync {first_elapsed:?}, second sync {second_elapsed:?}");
+}
+
+/// The startup of a run: the plan, before anything moves.
+///
+/// The plan is the part of a run that happens before any content travels, and
+/// it is the part that used to be slow and silent: it re-read the files the
+/// decision did not depend on, compiled an SQL statement per path, and asked
+/// both ends about every tracked path. The elapsed time is printed, for a
+/// human to read; there is deliberately no wall-clock assertion, for the same
+/// reason the rest of this file has none.
+#[test]
+#[ignore = "slow: the CI runs it in the `scale` job"]
+fn the_plan_of_a_synced_tree_is_quick() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let destination = root.path().join("destination");
+    let data = root.path().join("client-data");
+    let archive = root.path().join("archive");
+    for dir in [&source, &destination, &data, &archive] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    build_tree(&source);
+
+    // The first run moves the tree and fills the archive.
+    let mut first = common::client(&data);
+    first
+        .arg("sync")
+        .arg(&source)
+        .arg(&destination)
+        .arg("--auto")
+        .env("TWIN_ARCHIVE_DIR", &archive);
+    let (code, output) = common::run(&mut first);
+    assert_eq!(code, 0, "the first sync must succeed: {output}");
+
+    // The second run only has to plan: everything is already in sync, so
+    // that is the startup of a run.
+    let mut second = common::client(&data);
+    second
+        .arg("sync")
+        .arg(&source)
+        .arg(&destination)
+        .arg("--auto")
+        .env("TWIN_ARCHIVE_DIR", &archive);
+
+    let started = Instant::now();
+    let (code, output) = common::run(&mut second);
+    let elapsed = started.elapsed();
+    assert_eq!(code, 0, "the plan must succeed: {output}");
+
+    let counters = common::summary(&output);
+    assert_eq!(
+        counters.get("unchanged"),
+        Some(&(TOTAL as u64)),
+        "every file must already agree with the archive: {output}"
+    );
+
+    eprintln!("{TOTAL}-file tree: plan {elapsed:?}");
 }

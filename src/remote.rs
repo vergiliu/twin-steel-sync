@@ -2,7 +2,7 @@
 //! `Backend` seam the local filesystem does, so the engine does not know or care
 //! which it is talking to.
 
-use crate::fsutil::{fsync_hard, hash_file, mtime_ns, sync_dir, ErrCtx};
+use crate::fsutil::{hash_file, mtime_ns, DirFlush, ErrCtx, Fsync};
 use crate::model::{Entry, Hash, PathFailure};
 use crate::proto::{self, Frame, AGENT, PROTOCOL_VERSION, STATUS_MISSING, STATUS_OK};
 use crate::side::Backend;
@@ -70,6 +70,11 @@ pub struct RemoteBackend {
     spool_path: PathBuf,
     spool: Option<BufReader<File>>,
     listing_done: bool,
+    /// How hard the copy works to make the bytes durable. The far end is told,
+    /// because the far end is where the bytes land.
+    fsync: Fsync,
+    /// The directories this side wrote into, flushed once when the run ends.
+    flush: DirFlush,
 }
 
 impl RemoteBackend {
@@ -79,6 +84,7 @@ impl RemoteBackend {
         pinned: &str,
         defaults: bool,
         patterns: &[String],
+        fsync: Fsync,
     ) -> io::Result<RemoteBackend> {
         let config: Arc<ClientConfig> = tls::client_config(identity, pinned)?;
         let stream = tls::connect(&options.host, options.port, config)?;
@@ -93,6 +99,8 @@ impl RemoteBackend {
             )),
             spool: None,
             listing_done: false,
+            fsync,
+            flush: DirFlush::default(),
         };
         // Under TLS 1.3 the server's rejection can arrive after the client thinks
         // the handshake is done, so the hint belongs around the first exchange too.
@@ -122,6 +130,7 @@ impl RemoteBackend {
         self.send(&Frame::Rules {
             defaults,
             patterns: patterns.to_vec(),
+            fsync: self.fsync.code(),
         })
     }
 
@@ -230,7 +239,6 @@ impl RemoteBackend {
         offset: u64,
         tmp: &Path,
         local_dst: &Path,
-        parent: &Path,
         keep_partial: bool,
     ) -> io::Result<Hash> {
         self.send(&Frame::GetRange {
@@ -261,18 +269,16 @@ impl RemoteBackend {
             }
         };
 
+        let mode = self.fsync;
         let outcome = (|| -> io::Result<Hash> {
-            let mut writer = BufWriter::with_capacity(
-                256 * 1024,
-                fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(tmp)
-                    .ctx(|| format!("opening {}", tmp.display()))?,
-            );
+            let mut writer = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(tmp)
+                .ctx(|| format!("opening {}", tmp.display()))?;
             proto::read_stream(&mut self.stream, &mut writer)?;
             writer.flush()?;
-            fsync_hard(writer.get_ref())?;
+            crate::fsutil::fsync_file(&writer, mode)?;
             drop(writer);
             // The whole file is verified, the prefix included.
             let got = hash_file(tmp).ctx(|| format!("hashing {}", tmp.display()))?;
@@ -295,7 +301,6 @@ impl RemoteBackend {
                     local_dst.display()
                 )
             })?;
-            let _ = sync_dir(parent);
             Ok(expected)
         })();
         match outcome.as_ref().err() {
@@ -401,7 +406,7 @@ impl Backend for RemoteBackend {
                 hash: expected,
             })?;
         }
-        let mut reader = BufReader::new(File::open(local_src)?);
+        let mut reader = File::open(local_src)?;
         if offset > 0 {
             reader
                 .seek(SeekFrom::Start(offset))
@@ -435,8 +440,11 @@ impl Backend for RemoteBackend {
         // partial file is dropped and the transfer starts over.
         let mut restarted = false;
         loop {
-            match self.fetch(path, offset, &tmp, local_dst, parent, resume) {
-                Ok(hash) => return Ok(hash),
+            match self.fetch(path, offset, &tmp, local_dst, resume) {
+                Ok(hash) => {
+                    self.flush.note(parent);
+                    return Ok(hash);
+                }
                 Err(error) => {
                     let restart = !restarted && error.to_string().contains(proto::RESUME_TOO_LONG);
                     if !restart {
@@ -456,7 +464,14 @@ impl Backend for RemoteBackend {
     }
 
     fn finish(&mut self) -> io::Result<()> {
+        // The directories this side wrote into are flushed before the peer is
+        // told that the run is over.
+        self.flush.flush(self.fsync);
         let _ = self.send(&Frame::Bye);
+        // The peer flushes the directories it wrote into and answers. Waiting
+        // for that answer means the run is over only when the bytes are
+        // durable on both sides.
+        let _ = self.receive();
         let _ = self.stream.flush();
         Ok(())
     }

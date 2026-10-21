@@ -352,3 +352,42 @@ fn a_file_that_cannot_be_read_fails_alone() {
     )
     .unwrap();
 }
+
+/// F-021: the barrier policy is a choice, and the run says nothing about it
+/// when it is left alone. An unknown mode is a usage error.
+#[test]
+fn the_barrier_policy_is_a_choice_and_an_unknown_one_is_refused() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.source.join("a.txt"), "hello").unwrap();
+
+    for mode in ["full", "data", "off"] {
+        let (code, output) = sandbox.run(&[
+            "sync",
+            sandbox.source.to_str().unwrap(),
+            sandbox.destination.to_str().unwrap(),
+            "--auto",
+            "--fsync",
+            mode,
+        ]);
+        assert_eq!(code, 0, "{mode} must be a working mode: {output}");
+    }
+    assert_eq!(
+        sandbox.read(&sandbox.destination, "a.txt"),
+        "hello",
+        "every mode has to land the same content"
+    );
+
+    let (code, output) = sandbox.run(&[
+        "sync",
+        sandbox.source.to_str().unwrap(),
+        sandbox.destination.to_str().unwrap(),
+        "--auto",
+        "--fsync",
+        "sometimes",
+    ]);
+    assert_eq!(code, 2, "an unknown mode is a usage error: {output}");
+    assert!(
+        output.contains("--fsync wants full, data or off"),
+        "the error must say what is allowed: {output}"
+    );
+}

@@ -2,16 +2,16 @@
 //! far end of a TLS connection. Frames are length-prefixed, paths travel as raw
 //! bytes (Linux allows anything else), and file content flows in bounded chunks.
 
-use crate::fsutil::{hash_file, mtime_ns, sync_dir, ErrCtx};
+use crate::fsutil::{hash_file, mtime_ns, DirFlush, ErrCtx, Fsync};
 use crate::model::{Entry, Hash, Kind};
 use crate::scan::{entry_for, IgnoreRules, Scanner};
 use crate::side::safe_join;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const AGENT: &str = concat!("twin ", env!("CARGO_PKG_VERSION"));
 const CHUNK: usize = 256 * 1024;
 const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -60,6 +60,9 @@ pub enum Frame {
     Rules {
         defaults: bool,
         patterns: Vec<String>,
+        /// How hard the far end should work to make the bytes durable: the
+        /// far end is where the bytes land.
+        fsync: u8,
     },
     List,
     Entry(Entry),
@@ -118,9 +121,14 @@ pub fn write_frame<W: Write + ?Sized>(out: &mut W, frame: &Frame) -> io::Result<
             payload.extend_from_slice(&version.to_le_bytes());
             payload.extend_from_slice(agent.as_bytes());
         }
-        Frame::Rules { defaults, patterns } => {
+        Frame::Rules {
+            defaults,
+            patterns,
+            fsync,
+        } => {
             payload.push(RULES);
             payload.push(u8::from(*defaults));
+            payload.push(*fsync);
             let joined = patterns.join("\n");
             payload.extend_from_slice(&(joined.len() as u32).to_le_bytes());
             payload.extend_from_slice(joined.as_bytes());
@@ -279,12 +287,13 @@ fn decode(payload: &[u8]) -> io::Result<Frame> {
             Ok(Frame::Hello { version, agent })
         }
         RULES => {
-            if body.len() < 5 {
+            if body.len() < 6 {
                 return Err(bad("rules"));
             }
             let defaults = body[0] != 0;
-            let text_len = u32::from_le_bytes([body[1], body[2], body[3], body[4]]) as usize;
-            let text = &body[5..];
+            let fsync = body[1];
+            let text_len = u32::from_le_bytes([body[2], body[3], body[4], body[5]]) as usize;
+            let text = &body[6..];
             if text.len() < text_len {
                 return Err(bad("rules"));
             }
@@ -292,7 +301,11 @@ fn decode(payload: &[u8]) -> io::Result<Frame> {
                 .lines()
                 .map(str::to_string)
                 .collect();
-            Ok(Frame::Rules { defaults, patterns })
+            Ok(Frame::Rules {
+                defaults,
+                patterns,
+                fsync,
+            })
         }
         LIST => Ok(Frame::List),
         ENTRY => {
@@ -437,15 +450,18 @@ pub fn write_stream<R: Read + ?Sized, W: Write + ?Sized>(
     out: &mut W,
 ) -> io::Result<Hash> {
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        let read = input.read(&mut buf)?;
-        if read == 0 {
-            break;
+    crate::fsutil::with_scratch(|buf| -> io::Result<()> {
+        let chunk = &mut buf[..CHUNK];
+        loop {
+            let read = input.read(chunk)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&chunk[..read]);
+            write_frame(out, &Frame::Chunk(chunk[..read].to_vec()))?;
         }
-        hasher.update(&buf[..read]);
-        write_frame(out, &Frame::Chunk(buf[..read].to_vec()))?;
-    }
+        Ok(())
+    })?;
     write_frame(out, &Frame::End)?;
     out.flush()?;
     Ok(*hasher.finalize().as_bytes())
@@ -486,7 +502,24 @@ fn ack(out: &mut (impl Write + ?Sized), status: u8, hash: Hash, message: &str) -
 
 /// The far end. Speaks the protocol on the given streams and never touches
 /// anything outside `root`.
+///
+/// The directories that were written into are flushed once, when the
+/// connection ends: one barrier per directory instead of one per file.
 pub fn serve(root: &Path, input: &mut dyn Read, output: &mut dyn Write) -> io::Result<()> {
+    let mut flush = DirFlush::default();
+    let mut mode = Fsync::Full;
+    let outcome = serve_connection(root, input, output, &mut flush, &mut mode);
+    flush.flush(mode);
+    outcome
+}
+
+fn serve_connection(
+    root: &Path,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    flush: &mut DirFlush,
+    mode: &mut Fsync,
+) -> io::Result<()> {
     let banner = *blake3::hash(b"twin").as_bytes();
     match read_frame(input)? {
         Frame::Hello { version, agent } => {
@@ -522,7 +555,12 @@ pub fn serve(root: &Path, input: &mut dyn Read, output: &mut dyn Write) -> io::R
     output.flush()?;
 
     let rules = match read_frame(input)? {
-        Frame::Rules { defaults, patterns } => {
+        Frame::Rules {
+            defaults,
+            patterns,
+            fsync,
+        } => {
+            *mode = Fsync::from_code(fsync);
             IgnoreRules::from_patterns(root, defaults, &patterns)?
         }
         other => {
@@ -615,9 +653,14 @@ pub fn serve(root: &Path, input: &mut dyn Read, output: &mut dyn Write) -> io::R
                     }
                 };
                 let tmp = crate::side::temp_for(&abs);
-                let outcome = receive_file(input, &abs, &tmp, size, mtime, hash, 0, false);
+                let outcome = receive_file(input, &abs, &tmp, size, mtime, hash, 0, false, *mode);
                 match outcome {
-                    Ok(()) => ack(output, STATUS_OK, hash, "")?,
+                    Ok(()) => {
+                        if let Some(parent) = abs.parent() {
+                            flush.note(parent);
+                        }
+                        ack(output, STATUS_OK, hash, "")?
+                    }
                     Err(e) => {
                         // Without a resume the partial file is of no use to anyone.
                         let _ = fs::remove_file(&tmp);
@@ -642,9 +685,15 @@ pub fn serve(root: &Path, input: &mut dyn Read, output: &mut dyn Write) -> io::R
                     }
                 };
                 let tmp = crate::side::temp_for(&abs);
-                let outcome = receive_file(input, &abs, &tmp, size, mtime, hash, offset, true);
+                let outcome =
+                    receive_file(input, &abs, &tmp, size, mtime, hash, offset, true, *mode);
                 match outcome {
-                    Ok(()) => ack(output, STATUS_OK, hash, "")?,
+                    Ok(()) => {
+                        if let Some(parent) = abs.parent() {
+                            flush.note(parent);
+                        }
+                        ack(output, STATUS_OK, hash, "")?
+                    }
                     Err(e) => {
                         // A partial transfer is kept so the next run can continue
                         // it; a file that does not verify is thrown away.
@@ -678,7 +727,14 @@ pub fn serve(root: &Path, input: &mut dyn Read, output: &mut dyn Write) -> io::R
                 }
                 Err(e) => ack(output, STATUS_ERROR, banner, &e.to_string())?,
             },
-            Frame::Bye => return Ok(()),
+            Frame::Bye => {
+                // The run is over: the directories that were written into are
+                // flushed now, and the answer says so, so the other side knows
+                // the bytes are durable before it reports the run as done.
+                flush.flush(*mode);
+                ack(output, STATUS_OK, banner, "")?;
+                return Ok(());
+            }
             other => {
                 ack(
                     output,
@@ -740,10 +796,7 @@ fn send_file(output: &mut dyn Write, root: &Path, path: &Path, offset: u64) -> i
             hash,
         },
     )?;
-    let mut reader = BufReader::with_capacity(
-        CHUNK,
-        File::open(&abs).ctx(|| format!("opening {}", abs.display()))?,
-    );
+    let mut reader = File::open(&abs).ctx(|| format!("opening {}", abs.display()))?;
     if offset > 0 {
         reader
             .seek(SeekFrom::Start(offset))
@@ -777,6 +830,7 @@ fn receive_file(
     expected: Hash,
     offset: u64,
     resumable: bool,
+    mode: Fsync,
 ) -> io::Result<()> {
     let parent = abs
         .parent()
@@ -801,20 +855,16 @@ fn receive_file(
         let _ = fs::remove_file(tmp);
     }
 
-    let mut writer = BufWriter::with_capacity(
-        CHUNK,
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(tmp)
-            .ctx(|| format!("creating {}", tmp.display()))?,
-    );
+    let mut writer = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(tmp)
+        .ctx(|| format!("creating {}", tmp.display()))?;
     let result = (|| -> io::Result<()> {
         read_stream(input, &mut writer)
             .ctx(|| format!("receiving {} into {}", abs.display(), tmp.display()))?;
         writer.flush()?;
-        crate::fsutil::fsync_hard(writer.get_ref())
-            .ctx(|| format!("flushing {}", tmp.display()))?;
+        crate::fsutil::fsync_file(&writer, mode).ctx(|| format!("flushing {}", tmp.display()))?;
         drop(writer);
         // The whole file is verified, prefix included.
         let got = hash_file(tmp).ctx(|| format!("hashing {}", tmp.display()))?;
@@ -837,7 +887,6 @@ fn receive_file(
         }
         fs::rename(tmp, abs)
             .ctx(|| format!("moving {} into place at {}", tmp.display(), abs.display()))?;
-        let _ = sync_dir(parent);
         Ok(())
     })();
     if result.is_err() && !resumable {
@@ -849,6 +898,7 @@ fn receive_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufWriter;
 
     fn frames_round_trip(frame: Frame) {
         let mut buffer = Vec::new();
@@ -866,6 +916,7 @@ mod tests {
         frames_round_trip(Frame::Rules {
             defaults: true,
             patterns: vec!["*.log".into(), "build/".into()],
+            fsync: 0,
         });
         frames_round_trip(Frame::List);
         frames_round_trip(Frame::Entry(Entry {
@@ -959,6 +1010,7 @@ mod tests {
                 &Frame::Rules {
                     defaults: true,
                     patterns: vec![],
+                    fsync: 0,
                 },
             )
             .unwrap();
@@ -1078,6 +1130,7 @@ mod tests {
                 &Frame::Rules {
                     defaults: true,
                     patterns: vec![],
+                    fsync: 0,
                 },
             )
             .unwrap();

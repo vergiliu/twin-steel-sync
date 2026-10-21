@@ -1,5 +1,5 @@
 use crate::model::{BaseRow, Hash, Kind};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Statement};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -50,57 +50,45 @@ impl Archive {
             .map_err(to_io)
     }
 
-    pub fn get(&self, path: &Path) -> io::Result<Option<BaseRow>> {
-        let key = path.as_os_str().as_bytes().to_vec();
-        let mut stmt = self
+    /// A reader that holds its statement, prepared once.
+    ///
+    /// Preparing a statement is not free, and a run asks about every path in
+    /// the tree: one statement for the whole run is the difference between a
+    /// lookup and a lookup plus a compile.
+    pub fn reader(&self) -> io::Result<ArchiveReader<'_>> {
+        let stmt = self
             .conn
             .prepare(
                 "SELECT kind, size, mtime_source, mtime_destination, hash FROM entries WHERE path = ?1",
             )
             .map_err(to_io)?;
-        let mut rows = stmt.query(params![key]).map_err(to_io)?;
-        match rows.next().map_err(to_io)? {
-            None => Ok(None),
-            Some(row) => {
-                let kind: i64 = row.get(0).map_err(to_io)?;
-                let size: i64 = row.get(1).map_err(to_io)?;
-                let mtime_source: i64 = row.get(2).map_err(to_io)?;
-                let mtime_destination: i64 = row.get(3).map_err(to_io)?;
-                let hash: Vec<u8> = row.get(4).map_err(to_io)?;
-                if hash.len() != 32 {
-                    return Err(io::Error::other("archive holds a malformed hash"));
-                }
-                let mut h: Hash = [0u8; 32];
-                h.copy_from_slice(&hash);
-                Ok(Some(BaseRow {
-                    kind: Kind::from_sql(kind),
-                    size: size.max(0) as u64,
-                    mtime_source,
-                    mtime_destination,
-                    hash: h,
-                }))
-            }
-        }
+        Ok(ArchiveReader { stmt })
     }
 
-    pub fn put(&self, path: &Path, row: &BaseRow) -> io::Result<()> {
-        self.conn
-            .execute(
+    /// A writer that holds its statements, prepared once.
+    pub fn writer(&self) -> io::Result<ArchiveWriter<'_>> {
+        let put = self
+            .conn
+            .prepare(
                 "INSERT INTO entries (path, kind, size, mtime_source, mtime_destination, hash)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(path) DO UPDATE SET
                      kind=?2, size=?3, mtime_source=?4, mtime_destination=?5, hash=?6",
-                params![
-                    path.as_os_str().as_bytes().to_vec(),
-                    row.kind.to_sql(),
-                    row.size as i64,
-                    row.mtime_source,
-                    row.mtime_destination,
-                    row.hash.to_vec(),
-                ],
             )
-            .map(|_| ())
-            .map_err(to_io)
+            .map_err(to_io)?;
+        let delete = self
+            .conn
+            .prepare("DELETE FROM entries WHERE path = ?1")
+            .map_err(to_io)?;
+        Ok(ArchiveWriter { put, delete })
+    }
+
+    pub fn get(&self, path: &Path) -> io::Result<Option<BaseRow>> {
+        self.reader()?.get(path)
+    }
+
+    pub fn put(&self, path: &Path, row: &BaseRow) -> io::Result<()> {
+        self.writer()?.put(path, row)
     }
 
     /// `PRAGMA integrity_check`: the one honest answer to "is this file sane?".
@@ -111,13 +99,7 @@ impl Archive {
     }
 
     pub fn delete(&self, path: &Path) -> io::Result<()> {
-        self.conn
-            .execute(
-                "DELETE FROM entries WHERE path = ?1",
-                params![path.as_os_str().as_bytes().to_vec()],
-            )
-            .map(|_| ())
-            .map_err(to_io)
+        self.writer()?.delete(path)
     }
 
     /// Stream every remembered path without loading the archive into memory.
@@ -160,6 +142,70 @@ impl Archive {
 
 fn to_io(err: rusqlite::Error) -> io::Error {
     io::Error::other(format!("archive: {err}"))
+}
+
+/// Reads remembered rows through one prepared statement.
+pub struct ArchiveReader<'a> {
+    stmt: Statement<'a>,
+}
+
+impl<'a> ArchiveReader<'a> {
+    /// What the archive remembers about `path`, if anything.
+    pub fn get(&mut self, path: &Path) -> io::Result<Option<BaseRow>> {
+        let key = path.as_os_str().as_bytes().to_vec();
+        let mut rows = self.stmt.query(params![key]).map_err(to_io)?;
+        match rows.next().map_err(to_io)? {
+            None => Ok(None),
+            Some(row) => {
+                let kind: i64 = row.get(0).map_err(to_io)?;
+                let size: i64 = row.get(1).map_err(to_io)?;
+                let mtime_source: i64 = row.get(2).map_err(to_io)?;
+                let mtime_destination: i64 = row.get(3).map_err(to_io)?;
+                let hash: Vec<u8> = row.get(4).map_err(to_io)?;
+                if hash.len() != 32 {
+                    return Err(io::Error::other("archive holds a malformed hash"));
+                }
+                let mut h: Hash = [0u8; 32];
+                h.copy_from_slice(&hash);
+                Ok(Some(BaseRow {
+                    kind: Kind::from_sql(kind),
+                    size: size.max(0) as u64,
+                    mtime_source,
+                    mtime_destination,
+                    hash: h,
+                }))
+            }
+        }
+    }
+}
+
+/// Writes remembered rows through prepared statements.
+pub struct ArchiveWriter<'a> {
+    put: Statement<'a>,
+    delete: Statement<'a>,
+}
+
+impl<'a> ArchiveWriter<'a> {
+    pub fn put(&mut self, path: &Path, row: &BaseRow) -> io::Result<()> {
+        self.put
+            .execute(params![
+                path.as_os_str().as_bytes().to_vec(),
+                row.kind.to_sql(),
+                row.size as i64,
+                row.mtime_source,
+                row.mtime_destination,
+                row.hash.to_vec(),
+            ])
+            .map(|_| ())
+            .map_err(to_io)
+    }
+
+    pub fn delete(&mut self, path: &Path) -> io::Result<()> {
+        self.delete
+            .execute(params![path.as_os_str().as_bytes().to_vec()])
+            .map(|_| ())
+            .map_err(to_io)
+    }
 }
 
 /// Archive locations live outside any synced tree, keyed by the pair itself.

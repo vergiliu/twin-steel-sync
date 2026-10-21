@@ -34,6 +34,10 @@ pub struct Reporter<'a> {
     source: String,
     destination: String,
     progress: Progress,
+    /// The plan phase, which happens before anything is transferred.
+    plan: PlanProgress,
+    /// How many paths the plan has decided so far.
+    planned: u64,
 }
 
 impl<'a> Reporter<'a> {
@@ -51,6 +55,8 @@ impl<'a> Reporter<'a> {
             source: source.to_string(),
             destination: destination.to_string(),
             progress: Progress::new(opts.tty, !opts.json && !opts.quiet),
+            plan: PlanProgress::new(opts.tty, !opts.json && !opts.quiet),
+            planned: 0,
         }
     }
 
@@ -66,6 +72,33 @@ impl<'a> Reporter<'a> {
     /// How many bytes the run intends to move: the progress needs a total.
     pub fn set_total(&mut self, total: u64) {
         self.progress.set_total(total);
+    }
+
+    /// The plan is about to be built.
+    pub fn plan_started(&mut self) -> io::Result<()> {
+        self.plan.start();
+        Ok(())
+    }
+
+    /// The plan is being built: one more path has been decided.
+    ///
+    /// The plan is the part of a run that happens before anything moves, and
+    /// on a big tree it is the part that takes the longest. Saying how far it
+    /// has come keeps a run from looking like it has hung.
+    pub fn planning(&mut self) -> io::Result<()> {
+        self.planned += 1;
+        self.plan.path(self.planned);
+        if self.json && self.planned.is_multiple_of(PLAN_STEP) {
+            let mut object = Object::new("planning");
+            object.number("paths", self.planned);
+            writeln!(self.out, "{}", object.finish())?;
+        }
+        Ok(())
+    }
+
+    /// The plan is done: close the line that was drawn in place.
+    pub fn plan_finished(&mut self) -> io::Result<()> {
+        self.plan.finish()
     }
 
     /// The plan. In text this is the indented list the report has always
@@ -356,6 +389,91 @@ impl Progress {
     }
 }
 
+/// How far along the plan is.
+///
+/// The plan is built before anything moves, and on a big tree that takes a
+/// while — over the network it is a round trip per path. Without a line on
+/// the screen the run looks like it has hung.
+pub struct PlanProgress {
+    /// Whether a line is drawn at all.
+    enabled: bool,
+    /// Whether the line is drawn in place, which is what a terminal wants.
+    tty: bool,
+    started: Instant,
+    /// When the line was last drawn, so that it is not drawn too often.
+    last_draw: Instant,
+    /// Whether a line is on the screen right now.
+    drawn: bool,
+}
+
+/// How often the plan line is redrawn on a terminal.
+const PLAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// How many paths between two lines where there is no terminal.
+const PLAN_STEP: u64 = 1000;
+
+impl PlanProgress {
+    pub fn new(tty: bool, enabled: bool) -> PlanProgress {
+        let now = Instant::now();
+        PlanProgress {
+            enabled,
+            tty,
+            started: now,
+            last_draw: now,
+            drawn: false,
+        }
+    }
+
+    /// The plan is about to start: draw the line, so that the screen is not
+    /// blank while the plan is built.
+    pub fn start(&mut self) {
+        if self.enabled && self.tty {
+            self.draw(0);
+        }
+    }
+
+    /// One more path has been decided.
+    pub fn path(&mut self, paths: u64) {
+        if !self.enabled {
+            return;
+        }
+        if self.tty {
+            if self.last_draw.elapsed() >= PLAN_INTERVAL {
+                self.draw(paths);
+            }
+            return;
+        }
+        if paths.is_multiple_of(PLAN_STEP) {
+            let mut stderr = std::io::stderr();
+            let _ = writeln!(stderr, "{}", self.line(paths));
+        }
+    }
+
+    /// The plan is done: close the line that was drawn in place.
+    pub fn finish(&mut self) -> io::Result<()> {
+        if self.enabled && self.tty && self.drawn {
+            let mut stderr = std::io::stderr();
+            writeln!(stderr)?;
+        }
+        Ok(())
+    }
+
+    fn draw(&mut self, paths: u64) {
+        let line = self.line(paths);
+        let mut stderr = std::io::stderr();
+        let _ = write!(stderr, "\r{line}");
+        let _ = stderr.flush();
+        self.drawn = true;
+        self.last_draw = Instant::now();
+    }
+
+    fn line(&self, paths: u64) -> String {
+        format!(
+            "planning {paths} paths ({:.1}s)",
+            self.started.elapsed().as_secs_f64()
+        )
+    }
+}
+
 /// A number of bytes, in the unit a human reads at a glance.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -410,5 +528,25 @@ mod tests {
         let line = progress.line();
         assert!(line.contains("ETA -"), "{line}");
         assert!(line.contains(" - "), "{line}");
+    }
+
+    #[test]
+    fn the_json_stream_says_how_far_the_plan_has_come() {
+        let opts = crate::engine::RunOptions {
+            json: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        {
+            let mut reporter = Reporter::new(&mut out, &opts, "source", "destination");
+            for _ in 0..1000 {
+                reporter.planning().unwrap();
+            }
+        }
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(r#"{"type":"planning","paths":1000}"#),
+            "the plan must say how far it has come: {text}"
+        );
     }
 }

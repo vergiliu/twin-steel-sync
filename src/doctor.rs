@@ -285,7 +285,16 @@ pub fn remote(remote: &RemoteOptions, pin: &str) -> Vec<Check> {
     };
 
     let patterns: Vec<String> = Vec::new();
-    let mut backend = match RemoteBackend::connect(remote, &identity, pin, true, &patterns) {
+    // The doctor only reads from the far end, so the barrier policy is the
+    // default one: nothing is written.
+    let mut backend = match RemoteBackend::connect(
+        remote,
+        &identity,
+        pin,
+        true,
+        &patterns,
+        crate::fsutil::Fsync::Full,
+    ) {
         Ok(backend) => {
             checks.push(Check::pass(
                 "handshake",

@@ -1,1 +1,4 @@
-- everytime a new feature is added add its description in README.md file and mark it as implemented
+- rust language project
+- every time a new feature is added add its description in README.md file and mark it as implemented in @FEATURES.md file
+- every time a feature is requested add it first in @PENDING.md file 
+- build test and evaluation tooling during planning in rust not in Python

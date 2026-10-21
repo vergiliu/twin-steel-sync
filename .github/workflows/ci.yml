@@ -90,8 +90,8 @@ jobs:
   scale:
     # The 1k-file tree of F-071 is ignored by the default test run: F-021 puts
     # every file through an fsync, and on macOS that fsync is an F_FULLFSYNC, so
-    # a thousand files cost about a minute. It is still checked on every push,
-    # here, where it can have a timeout of its own.
+    # a thousand files cost tens of seconds there. It is still checked on every
+    # push, here, where it can have a timeout of its own.
     name: scale (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # A thousand files, one fsync each: this job is allowed to take a long

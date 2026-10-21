@@ -346,6 +346,75 @@ fn ignored_paths_stay_put_and_do_not_haunt_later_runs() {
     );
 }
 
+/// The archive sweep: a path that is gone from both ends is forgotten, and a
+/// path that is still there keeps its row. The walk already knows which paths
+/// are there, so the sweep only has to look at the ones it did not see.
+#[test]
+fn a_path_that_is_gone_from_both_ends_is_forgotten_and_one_that_stays_keeps_its_row() {
+    let pair = Pair::new();
+    pair.put(Side::Source, "gone.txt", "x");
+    pair.put(Side::Source, "kept.txt", "y");
+    pair.go(&pair.options());
+
+    // The file is removed on both sides: the pair no longer tracks it.
+    fs::remove_file(pair.source.join("gone.txt")).unwrap();
+    fs::remove_file(pair.destination.join("gone.txt")).unwrap();
+
+    let (summary, _) = pair.go(&pair.options());
+    assert_eq!(summary.deleted, 0, "nothing is deleted without --delete");
+
+    let archive = twin::archive::Archive::open(&archive_file(&pair.archive)).unwrap();
+    assert!(
+        archive.get(Path::new("gone.txt")).unwrap().is_none(),
+        "a path that is gone from both ends must not stay in the archive"
+    );
+    assert!(
+        archive.get(Path::new("kept.txt")).unwrap().is_some(),
+        "a path that is still there must keep its row"
+    );
+
+    // And the row that was kept is still the one the pair agreed on.
+    let (again, _) = pair.go(&pair.options());
+    assert_eq!(
+        again.created + again.updated + again.deleted,
+        0,
+        "a run with nothing to do must do nothing"
+    );
+}
+
+/// A file whose time moved on both sides but whose bytes did not: the two
+/// ends still agree, so nothing is transferred and only the archive row is
+/// refreshed. The plan has to read both sides to know that.
+#[test]
+fn a_file_that_only_moved_is_not_copied_again() {
+    let pair = Pair::new();
+    pair.put(Side::Source, "same.txt", "content");
+    pair.put(Side::Destination, "same.txt", "content");
+    let (summary, _) = pair.go(&pair.options());
+    assert_eq!(summary.created, 0, "both ends already hold the same bytes");
+
+    // The time moves on both sides; the bytes do not.
+    let later = FileTime::from_unix_time(1_700_000_000, 0);
+    filetime::set_file_mtime(pair.source.join("same.txt"), later).unwrap();
+    filetime::set_file_mtime(pair.destination.join("same.txt"), later).unwrap();
+
+    let (summary, _) = pair.go(&pair.options());
+    assert_eq!(
+        summary.updated, 0,
+        "the bytes did not change: nothing is transferred"
+    );
+    assert_eq!(summary.unchanged, 1, "the two ends still agree");
+    assert_eq!(pair.get(Side::Destination, "same.txt"), "content");
+
+    // And the row now knows the new times, so the next run is quiet.
+    let (again, _) = pair.go(&pair.options());
+    assert_eq!(
+        again.created + again.updated + again.deleted,
+        0,
+        "a run with nothing to do must do nothing"
+    );
+}
+
 #[test]
 fn the_source_is_read_and_the_destination_is_written() {
     let pair = Pair::new();

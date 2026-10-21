@@ -1,7 +1,7 @@
-use crate::archive::{archive_path, Archive};
+use crate::archive::{archive_path, Archive, ArchiveReader, ArchiveWriter};
 use crate::backup;
 use crate::classify::{self, Resolved, Verdict};
-use crate::fsutil::{timestamp_utc, ErrCtx};
+use crate::fsutil::{timestamp_utc, ErrCtx, Fsync};
 use crate::model::{
     cmp_path, metadata_matches, Action, BaseRow, Entry, Hash, Kind, PathFailure, Role,
 };
@@ -11,8 +11,10 @@ use crate::scan::{absolute, patterns_for, IgnoreRules};
 use crate::side::{Backend, LocalBackend};
 use crate::tls;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// One end of a run: a directory on this machine, or a peer on another machine.
@@ -61,6 +63,8 @@ pub struct RunOptions {
     pub tty: bool,
     pub verbose: bool,
     pub quiet: bool,
+    /// How hard the run works to make the bytes durable.
+    pub fsync: Fsync,
 }
 
 impl Default for RunOptions {
@@ -81,6 +85,7 @@ impl Default for RunOptions {
             tty: false,
             verbose: false,
             quiet: false,
+            fsync: Fsync::Full,
         }
     }
 }
@@ -165,29 +170,26 @@ pub fn run(
             validate_roots(source, destination)?;
             let (rules, _) = rules_for(source, opts)?;
             let mut source_side =
-                LocalBackend::excluding(source, rules.clone(), excluded_dirs(opts))?;
+                LocalBackend::excluding(source, rules.clone(), excluded_dirs(opts), opts.fsync)?;
             let mut destination_side =
-                LocalBackend::excluding(destination, rules, excluded_dirs(opts))?;
+                LocalBackend::excluding(destination, rules, excluded_dirs(opts), opts.fsync)?;
             run_pair(&mut source_side, &mut destination_side, opts, out)
         }
         (End::Local(source), End::Remote(remote)) => {
             validate_local_root(source)?;
             let (rules, patterns) = rules_for(source, opts)?;
             let mut remote = connect(remote, pin, opts, &patterns)?;
-            let mut source_side = LocalBackend::excluding(source, rules, excluded_dirs(opts))?;
-            let outcome = run_pair(&mut source_side, &mut remote, opts, out);
-            let closed = remote.finish();
-            outcome.and_then(|summary| closed.map(|()| summary))
+            let mut source_side =
+                LocalBackend::excluding(source, rules, excluded_dirs(opts), opts.fsync)?;
+            run_pair(&mut source_side, &mut remote, opts, out)
         }
         (End::Remote(remote), End::Local(destination)) => {
             validate_local_root(destination)?;
             let (rules, patterns) = rules_for(destination, opts)?;
             let mut remote = connect(remote, pin, opts, &patterns)?;
             let mut destination_side =
-                LocalBackend::excluding(destination, rules, excluded_dirs(opts))?;
-            let outcome = run_pair(&mut remote, &mut destination_side, opts, out);
-            let closed = remote.finish();
-            outcome.and_then(|summary| closed.map(|()| summary))
+                LocalBackend::excluding(destination, rules, excluded_dirs(opts), opts.fsync)?;
+            run_pair(&mut remote, &mut destination_side, opts, out)
         }
     }
 }
@@ -213,7 +215,14 @@ fn connect(
         )
     })?;
     let identity = tls::Identity::load_or_create(&tls::data_dir())?;
-    RemoteBackend::connect(remote, &identity, pin, opts.default_ignores, patterns)
+    RemoteBackend::connect(
+        remote,
+        &identity,
+        pin,
+        opts.default_ignores,
+        patterns,
+        opts.fsync,
+    )
 }
 
 /// The directories the local tree must never walk into.
@@ -229,6 +238,20 @@ fn excluded_dirs(opts: &RunOptions) -> Vec<PathBuf> {
 }
 
 fn run_pair(
+    source: &mut dyn Backend,
+    destination: &mut dyn Backend,
+    opts: &RunOptions,
+    out: &mut dyn Write,
+) -> io::Result<Summary> {
+    let outcome = plan_and_apply(source, destination, opts, out);
+    // Both ends are finished even when the run failed: the directories that
+    // were written into have to be flushed either way, and the peer has to be
+    // told that the run is over.
+    let closed = source.finish().and_then(|()| destination.finish());
+    outcome.and_then(|summary| closed.map(|()| summary))
+}
+
+fn plan_and_apply(
     source: &mut dyn Backend,
     destination: &mut dyn Backend,
     opts: &RunOptions,
@@ -255,7 +278,11 @@ fn run_pair(
 
     let stamp = timestamp_utc();
     let mut reporter = Reporter::new(out, opts, &source_label, &destination_label);
-    let plan = build_plan(source, destination, &archive, opts)?;
+    // The plan comes before anything moves, and on a big tree it is the part
+    // that takes the longest: say that it has started.
+    reporter.plan_started()?;
+    let plan = build_plan(source, destination, &archive, opts, &mut reporter)?;
+    reporter.plan_finished()?;
 
     // The JSON stream starts with the plan: it is what the run intends to do,
     // before anything is attempted.
@@ -350,13 +377,17 @@ fn run_pair(
     }
 
     reporter.set_total(planned_bytes(&plan.actions));
+    // One prepared statement set for the whole run: every file that is
+    // transferred writes a row, and preparing a statement per row is a
+    // compile per row.
+    let mut writer = archive.writer()?;
     for action in &plan.actions {
         crate::debug!("applying: {}", action.describe());
         match apply(
             action,
             source,
             destination,
-            &archive,
+            &mut writer,
             &mut summary,
             &mut reporter,
             opts,
@@ -396,10 +427,22 @@ fn build_plan(
     destination: &mut dyn Backend,
     archive: &Archive,
     opts: &RunOptions,
+    reporter: &mut Reporter<'_>,
 ) -> io::Result<Plan> {
     let mut actions = Vec::new();
     let mut unchanged = 0u64;
     let mut failures: Vec<PathFailure> = Vec::new();
+
+    // One prepared statement for the whole plan: the plan asks about every
+    // path in the tree, and preparing a statement per path is a compile per
+    // path.
+    let mut reader = archive.reader()?;
+
+    // The paths the archive tracks and the walk has seen. A tracked path that
+    // is still there keeps its row; one that is gone from both ends is
+    // forgotten. The walk already knows which paths are there, so the sweep
+    // below only has to look at the paths the walk did not see.
+    let mut alive: HashSet<Vec<u8>> = HashSet::new();
 
     let mut snext = source.walk()?;
     let mut dnext = destination.walk()?;
@@ -441,22 +484,31 @@ fn build_plan(
             .map(|entry| entry.path.clone());
         if let Some(path) = path {
             // One path that cannot be planned must not stop the others.
-            if let Err(error) = handle_path(
+            match handle_path(
                 &path,
                 s_entry.as_ref(),
                 d_entry.as_ref(),
                 source,
                 destination,
-                archive,
+                &mut reader,
                 opts,
                 &mut actions,
                 &mut unchanged,
             ) {
-                failures.push(PathFailure {
+                // The archive tracks this path and the walk has seen it: it is
+                // still there, so its row stays.
+                Ok(true) => {
+                    alive.insert(path.as_os_str().as_bytes().to_vec());
+                }
+                Ok(false) => {}
+                Err(error) => failures.push(PathFailure {
                     path,
                     message: error.to_string(),
-                });
+                }),
             }
+            // The plan is the part of a run that happens before anything
+            // moves: say how far it has come.
+            reporter.planning()?;
         }
 
         if take_source {
@@ -470,8 +522,15 @@ fn build_plan(
     // Rows whose path is gone from both ends are dropped. Paths that are merely
     // ignored stay: they still exist on disk, so they must not be treated as
     // deletions.
+    //
+    // The walk has already seen every path that is still there, so only the
+    // paths it did not see are looked up: a path that was deleted on both ends
+    // is gone, and a path that is merely ignored or excluded is still on disk.
     let mut forgotten = Vec::new();
     archive.for_each(|path, _row| {
+        if alive.contains(path.as_os_str().as_bytes()) {
+            return Ok(());
+        }
         let here = match source.stat(path) {
             Ok(entry) => entry,
             Err(error) => {
@@ -519,12 +578,15 @@ fn handle_path(
     d: Option<&Entry>,
     source: &mut dyn Backend,
     destination: &mut dyn Backend,
-    archive: &Archive,
+    reader: &mut ArchiveReader<'_>,
     opts: &RunOptions,
     actions: &mut Vec<Action>,
     unchanged: &mut u64,
-) -> io::Result<()> {
-    let base = archive.get(path)?;
+) -> io::Result<bool> {
+    let base = reader.get(path)?;
+    // Whether the archive tracks this path: the sweep needs to know, so that
+    // a path the walk has seen keeps its row.
+    let tracked = base.is_some();
 
     // Directories carry no content; they exist implicitly around synced files.
     if matches!(s.map(|e| e.kind), Some(Kind::Dir)) || matches!(d.map(|e| e.kind), Some(Kind::Dir))
@@ -537,7 +599,7 @@ fn handle_path(
                 });
             }
         }
-        return Ok(());
+        return Ok(tracked);
     }
     for entry in [s, d].into_iter().flatten() {
         if entry.kind != Kind::File {
@@ -549,23 +611,51 @@ fn handle_path(
                 path: path.to_path_buf(),
                 reason,
             });
-            return Ok(());
+            return Ok(tracked);
         }
     }
 
-    let sres = match s {
-        Some(entry) => Some(resolve(entry, base.as_ref(), Role::Source, source, opts)?),
-        None => None,
-    };
-    let dres = match d {
-        Some(entry) => Some(resolve(
-            entry,
-            base.as_ref(),
-            Role::Destination,
-            destination,
-            opts,
-        )?),
-        None => None,
+    // The content of a file is only needed when the verdict depends on it.
+    // The source always wins: a file the destination does not have is copied,
+    // and the copy hashes the bytes it reads, so hashing the file here would
+    // read it twice. A file the source does not have is removed, whatever it
+    // holds.
+    let (sres, dres) = match (s, d) {
+        (Some(se), Some(de)) => {
+            let source = resolve(se, base.as_ref(), Role::Source, &mut *source, opts)?;
+            // The source has changed: the file is copied whatever the
+            // destination holds, so the destination's content is not needed.
+            // With --checksum it is hashed anyway, because distrusting the
+            // metadata is what --checksum is for.
+            let destination = if base.is_some() && source.changed && !opts.checksum {
+                resolve_unread(de, base.as_ref(), Role::Destination)
+            } else {
+                resolve(
+                    de,
+                    base.as_ref(),
+                    Role::Destination,
+                    &mut *destination,
+                    opts,
+                )?
+            };
+            (Some(source), Some(destination))
+        }
+        (Some(se), None) => (Some(resolve_unread(se, base.as_ref(), Role::Source)), None),
+        (None, Some(de)) => (
+            None,
+            Some(if opts.checksum {
+                resolve(
+                    de,
+                    base.as_ref(),
+                    Role::Destination,
+                    &mut *destination,
+                    opts,
+                )?
+            } else {
+                resolve_unread(de, base.as_ref(), Role::Destination)
+            }),
+        ),
+        (None, None) => (None, None),
     };
 
     let verdict = classify::decide(sres.as_ref(), dres.as_ref(), base.as_ref(), opts.delete);
@@ -586,7 +676,7 @@ fn handle_path(
             // so the hash is known and the row can be written.
             let (Some(se), Some(de), Some(hash)) = (s, d, sres.as_ref().and_then(|r| r.hash))
             else {
-                return Ok(());
+                return Ok(tracked);
             };
             actions.push(Action::Adopt {
                 path: path.to_path_buf(),
@@ -614,7 +704,7 @@ fn handle_path(
             reason,
         }),
     }
-    Ok(())
+    Ok(tracked)
 }
 
 /// What this end holds right now, and whether it still holds what the pair
@@ -654,6 +744,25 @@ fn resolve(
         hash: Some(hash),
         changed,
     })
+}
+
+/// What this end holds, without reading the file.
+///
+/// Used when the verdict cannot depend on the content: the source always
+/// wins, so a file the destination does not have is copied and a file the
+/// source does not have is removed, whatever they hold. Reading the file here
+/// would mean reading it twice for every transfer.
+fn resolve_unread(entry: &Entry, base: Option<&BaseRow>, role: Role) -> Resolved {
+    match base {
+        Some(row) if metadata_matches(entry, row, role) => Resolved {
+            hash: Some(row.hash),
+            changed: false,
+        },
+        _ => Resolved {
+            hash: None,
+            changed: true,
+        },
+    }
 }
 
 /// The archive row as it should be written when the two ends already agree.
@@ -743,7 +852,7 @@ fn apply(
     action: &Action,
     source: &mut dyn Backend,
     destination: &mut dyn Backend,
-    archive: &Archive,
+    writer: &mut ArchiveWriter<'_>,
     summary: &mut Summary,
     reporter: &mut Reporter<'_>,
     opts: &RunOptions,
@@ -761,7 +870,7 @@ fn apply(
             reporter.transfer_start(path, *size)?;
             let hash = transfer_with_retry(source, destination, path, opts)?;
             reporter.transfer_done(path, *size)?;
-            record(source, destination, path, hash, archive)?;
+            record(source, destination, path, hash, writer)?;
             if *new_file {
                 summary.created += 1;
             } else {
@@ -771,14 +880,14 @@ fn apply(
         Action::Delete { path } => {
             backup_before(destination, path, opts, stamp)?;
             destination.remove(path)?;
-            archive.delete(path)?;
+            writer.delete(path)?;
             summary.deleted += 1;
         }
         Action::Adopt { path, row } => {
-            archive.put(path, row)?;
+            writer.put(path, row)?;
         }
         Action::Forget { path } => {
-            archive.delete(path)?;
+            writer.delete(path)?;
         }
         Action::Skip { .. } => {
             summary.skipped += 1;
@@ -844,7 +953,7 @@ fn record(
     destination: &mut dyn Backend,
     path: &Path,
     hash: Hash,
-    archive: &Archive,
+    writer: &mut ArchiveWriter<'_>,
 ) -> io::Result<()> {
     let here = source.stat(path)?;
     let there = destination.stat(path)?;
@@ -859,7 +968,7 @@ fn record(
             path.display()
         )));
     }
-    archive.put(
+    writer.put(
         path,
         &BaseRow {
             kind: Kind::File,

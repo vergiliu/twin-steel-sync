@@ -8,7 +8,7 @@
 |---|---|---|
 | **F-027** — path confinement | The client half is open. `safe_join` (rejects absolute paths, `..` and symlinked ancestors) is used by the server only; the client joins remote-supplied paths onto its local root unchecked, in `LocalBackend::{hash,stat,put,get,remove}` and in the engine's transfer. `Path::join` with an absolute path replaces the base, so a peer holding the pinned certificate can make the client write — or delete — outside the local root. Route every remote-originated path through `safe_join` before it reaches the local backend, and add the regression test: a server that answers LIST with an absolute path and DELETE with `../../x` | small: the function and its unit tests exist |
 | **F-061** — name representation | Names travel as raw bytes, but a name the destination cannot represent (non-UTF-8 created on Linux, an NFD/NFC or case variant of an existing path on macOS) is written anyway instead of being skipped with a named reason | small: one comparison per planned path, plus a skip reason |
-| **F-013** — plan memory | The walk streams, but the plan accumulates every action in a `Vec`, so memory grows with the number of changes rather than staying bounded per directory | medium: the plan has to become a stream, or the actions have to be applied as they are produced |
+| **F-013** — plan memory | The walk streams, but the plan accumulates every action in a `Vec`, so memory grows with the number of changes rather than staying bounded per directory; the sweep also remembers the tracked paths the walk has seen, so that a path which is gone from both ends is forgotten without asking either end about it | medium: the plan has to become a stream, or the actions have to be applied as they are produced |
 | **F-064** — root sanity | A root of `.` is accepted; only `/` is refused | trivial |
 | **F-016** — plan/apply equivalence | The test compares the plan a dry run prints with the plan a real run prints. The requirement asks for an instrumented run: one that records what it actually did | small |
 | **F-010** — inode in the fast path | The fast path compares size + mtime + kind. The original requirement said inode; FEATURES.md now describes what the code does. Adding an inode column would make the fast path stricter, but inode is not portable to the exFAT/NTFS targets this program names, so the amended requirement is the honest fix unless someone decides otherwise | small, and probably not worth it |
@@ -37,10 +37,7 @@ N machines with no hub = N(N−1)/2 pairs; fine for 2–4 devices, and each pair
 
 ## 3. Findings still open from the code review
 
-- **The archive sweep asks the source about every tracked path.** One stat per path per run; over TLS that is one round trip per tracked file before the plan even exists. The destination is only asked when the source no longer has the path, so half the cost is already gone. A merge-walk of the archive against the source listing would remove the rest.
-- **`Archive::get` re-prepares its SQL statement on every call** — one statement compile per path per run. Prepare it once.
 - **No per-pair lock.** Two `twin sync` runs on the same pair interleave their plan and apply, and can write stale "last agreed" rows. The stated deployment is cron/systemd/launchd, where overlap happens. `libc` is already a dependency, so `flock` is free and auto-releases when the process dies.
-- **macOS throughput.** F-021's per-file `F_FULLFSYNC` is correct but slow: a 400 MB / 400-file transfer took 64 s. Consider making it configurable.
 - **Packaging hygiene.** `Cargo.toml` declares `license = "MIT OR Apache-2.0"` with no LICENSE file in the repo. `libsqlite3-sys` drags the `pkg-config` and `vcpkg` build dependencies into the build tree although SQLite is compiled from source (`bundled`) — check whether turning rusqlite's default features off trims them.
 
 ## 4. Open decisions (a human has to call these)

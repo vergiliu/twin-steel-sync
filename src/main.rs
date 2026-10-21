@@ -97,6 +97,9 @@ struct PairArgs {
     /// Keep an interrupted transfer and continue it on the next run
     #[arg(long)]
     partial: bool,
+    /// How hard to work to make the bytes durable: full, data or off
+    #[arg(long, value_name = "MODE", default_value = "full")]
+    fsync: String,
     /// Certificate fingerprint the server must present (needed the first time you
     /// talk to a host; it is remembered afterwards)
     #[arg(long, value_name = "HEX")]
@@ -179,6 +182,17 @@ fn sync(args: PairArgs) -> ExitCode {
         },
     };
 
+    let fsync = match twin::fsutil::Fsync::parse(&args.fsync) {
+        Some(mode) => mode,
+        None => {
+            eprintln!(
+                "error: --fsync wants full, data or off; got {:?}",
+                args.fsync
+            );
+            return ExitCode::from(2);
+        }
+    };
+
     let mut options = RunOptions {
         dry_run: args.dry_run,
         delete: args.delete,
@@ -193,6 +207,7 @@ fn sync(args: PairArgs) -> ExitCode {
         tty: io::stderr().is_terminal(),
         verbose: args.verbose > 0,
         quiet: args.quiet,
+        fsync,
         ..Default::default()
     };
     if let Some(dir) = args.archive_dir {

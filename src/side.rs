@@ -1,5 +1,6 @@
 use crate::fsutil::{
-    copy_atomic, copy_resumable, hash_file, prune_empty_dirs, temp_file_name, ErrCtx,
+    copy_atomic, copy_resumable, hash_file, prune_empty_dirs, temp_file_name, DirFlush, ErrCtx,
+    Fsync,
 };
 use crate::model::{Entry, Hash, PathFailure};
 use crate::scan::{entry_for, IgnoreRules, Scanner};
@@ -41,15 +42,26 @@ pub struct LocalBackend {
     label: String,
     root: PathBuf,
     scanner: Option<Scanner>,
+    /// How hard the copy works to make the bytes durable.
+    fsync: Fsync,
+    /// The directories this side wrote into, flushed once when the run ends.
+    flush: DirFlush,
 }
 
 impl LocalBackend {
     /// A backend that never walks into the given absolute directories.
-    pub fn excluding(root: &Path, rules: IgnoreRules, excluded: Vec<PathBuf>) -> io::Result<Self> {
+    pub fn excluding(
+        root: &Path,
+        rules: IgnoreRules,
+        excluded: Vec<PathBuf>,
+        fsync: Fsync,
+    ) -> io::Result<Self> {
         Ok(LocalBackend {
             label: root.display().to_string(),
             root: root.to_path_buf(),
             scanner: Some(Scanner::with_excluded(root, rules, excluded)?),
+            fsync,
+            flush: DirFlush::default(),
         })
     }
 
@@ -99,21 +111,33 @@ impl Backend for LocalBackend {
     fn put(&mut self, path: &Path, local_src: &Path, resume: bool) -> io::Result<Hash> {
         let dst = self.root.join(path);
         let tmp = temp_for(&dst);
-        if resume {
-            copy_resumable(local_src, &dst, &tmp)
+        let hash = if resume {
+            copy_resumable(local_src, &dst, &tmp, self.fsync)
         } else {
-            copy_atomic(local_src, &dst, &tmp)
+            copy_atomic(local_src, &dst, &tmp, self.fsync)
+        };
+        if hash.is_ok() {
+            if let Some(parent) = dst.parent() {
+                self.flush.note(parent);
+            }
         }
+        hash
     }
 
     fn get(&mut self, path: &Path, local_dst: &Path, resume: bool) -> io::Result<Hash> {
         let src = self.root.join(path);
         let tmp = temp_for(local_dst);
-        if resume {
-            copy_resumable(&src, local_dst, &tmp)
+        let hash = if resume {
+            copy_resumable(&src, local_dst, &tmp, self.fsync)
         } else {
-            copy_atomic(&src, local_dst, &tmp)
+            copy_atomic(&src, local_dst, &tmp, self.fsync)
+        };
+        if hash.is_ok() {
+            if let Some(parent) = local_dst.parent() {
+                self.flush.note(parent);
+            }
         }
+        hash
     }
 
     fn remove(&mut self, path: &Path) -> io::Result<()> {
@@ -126,6 +150,12 @@ impl Backend for LocalBackend {
         if let Some(parent) = target.parent() {
             prune_empty_dirs(&self.root, parent);
         }
+        Ok(())
+    }
+
+    /// Flush the directories this side wrote into, once each.
+    fn finish(&mut self) -> io::Result<()> {
+        self.flush.flush(self.fsync);
         Ok(())
     }
 }

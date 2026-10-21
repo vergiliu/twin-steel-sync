@@ -36,6 +36,42 @@ so.
 
 ## What changed
 
+### `--fsync` chooses how hard a run works to be durable
+
+Every file is written to a temporary file, fsynced and renamed into place, so
+a half-written file never appears under its real name. The barrier itself is
+now a choice:
+
+| Mode | What it does |
+|---|---|
+| `--fsync full` (default) | `F_FULLFSYNC` on macOS, `fsync` elsewhere: the bytes are on the disk when the call returns |
+| `--fsync data` | `fsync` only: the bytes reached the drive, its own cache may still hold them |
+| `--fsync off` | no barrier: the bytes are in the page cache |
+
+A directory that was written into is fsynced once, when the run ends, instead
+of once per file — on macOS that per-file directory fsync used to cost more
+than the copy itself. The far end is told which mode the run wants and
+confirms it when the run is over, so a run is only finished when the bytes
+are durable on both sides.
+
+On macOS, `full` and `data` cost about the same: both flush the drive, and
+the drive is what takes the time. `off` is the fast one — a tree of four
+thousand small files goes from about a minute and a half to a few seconds —
+and it is the one that can lose the last writes in a power cut.
+
+### The startup says what it is doing
+
+The plan — the part of a run that happens before anything moves — used to be
+silent, which on a big tree looked like a hang. It now says how many paths it
+has decided: drawn in place on a terminal, one line every thousand paths
+elsewhere, and a `planning` event in the JSON stream.
+
+A run also got cheaper in three places that had nothing to do with the size
+of the tree: the archive statements are prepared once per run instead of once
+per path, the archive sweep asks about the paths the walk did not see instead
+of every tracked path (one round trip per tracked file over TLS, gone), and a
+file is only read when the decision depends on its content.
+
 ### The fingerprint is printed on startup, and `twin id` is gone
 
 `twin id` used to be the way to find out this machine's fingerprint, which is

@@ -1,13 +1,125 @@
 use crate::model::Hash;
 use filetime::FileTime;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const BUF: usize = 1 << 20;
+
+thread_local! {
+    /// One buffer per thread, reused by every hash and every copy.
+    ///
+    /// Allocating a megabyte per file is what made hashing a tree slow: the
+    /// pages were faulted in and zeroed again for every file, and the bytes
+    /// were thrown away right after.
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with the shared buffer, big enough to hold a whole chunk.
+///
+/// The buffer belongs to the thread and is handed out for the duration of the
+/// call only: nothing inside `f` may ask for it again.
+pub fn with_scratch<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
+    SCRATCH.with(|cell| {
+        let mut buffer = cell.borrow_mut();
+        if buffer.len() < BUF {
+            buffer.resize(BUF, 0);
+        }
+        f(&mut buffer)
+    })
+}
+
+/// How hard a run works to make the bytes durable.
+///
+/// The default is the strongest barrier the platform offers, because a file
+/// that is renamed into place has to survive a power cut. The weaker modes
+/// exist because that barrier is expensive: on macOS an `F_FULLFSYNC` costs
+/// tens of milliseconds, which is more than the copy of a small file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fsync {
+    /// `F_FULLFSYNC` on macOS, `fsync` elsewhere: the bytes are on the disk
+    /// when the call returns.
+    Full,
+    /// `fsync`: the bytes reached the drive, but the drive's own cache may
+    /// still be holding them.
+    Data,
+    /// No barrier at all: the bytes are in the page cache.
+    Off,
+}
+
+impl Fsync {
+    /// The name the command line uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            Fsync::Full => "full",
+            Fsync::Data => "data",
+            Fsync::Off => "off",
+        }
+    }
+
+    /// The mode a `--fsync` argument names.
+    pub fn parse(text: &str) -> Option<Fsync> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(Fsync::Full),
+            "data" => Some(Fsync::Data),
+            "off" => Some(Fsync::Off),
+            _ => None,
+        }
+    }
+
+    /// The mode the wire protocol carries.
+    pub fn code(self) -> u8 {
+        match self {
+            Fsync::Full => 0,
+            Fsync::Data => 1,
+            Fsync::Off => 2,
+        }
+    }
+
+    /// The mode a wire protocol code names.
+    pub fn from_code(code: u8) -> Fsync {
+        match code {
+            1 => Fsync::Data,
+            2 => Fsync::Off,
+            _ => Fsync::Full,
+        }
+    }
+}
+
+/// The directories a run wrote into, so that each can be flushed once when
+/// the run ends instead of once per file.
+///
+/// A directory fsync is what makes a rename durable. Doing it per file costs a
+/// barrier per file; doing it once per directory, at the end of the run, costs
+/// one barrier per directory and leaves the same guarantee once the run is
+/// over.
+#[derive(Debug, Default)]
+pub struct DirFlush {
+    dirs: std::collections::BTreeSet<PathBuf>,
+}
+
+impl DirFlush {
+    /// Remember that a file was written into `dir`.
+    pub fn note(&mut self, dir: &Path) {
+        self.dirs.insert(dir.to_path_buf());
+    }
+
+    /// Flush every directory that was written to, once each.
+    pub fn flush(&mut self, mode: Fsync) {
+        if mode == Fsync::Off {
+            self.dirs.clear();
+            return;
+        }
+        for dir in std::mem::take(&mut self.dirs) {
+            // A directory that cannot be fsynced is no reason to fail the run:
+            // the file itself is already durable.
+            let _ = sync_dir(&dir);
+        }
+    }
+}
 
 /// The name of the temporary file that holds a transfer in flight, derived from
 /// the destination it will be renamed to.
@@ -78,24 +190,29 @@ pub fn retry_once<T>(what: &str, mut attempt: impl FnMut() -> io::Result<T>) -> 
 }
 
 pub fn hash_file(path: &Path) -> io::Result<Hash> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::with_capacity(BUF, file);
+    let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; BUF];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+    with_scratch(|buf| -> io::Result<()> {
+        loop {
+            let n = file.read(buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
         }
-        hasher.update(&buf[..n]);
-    }
+        Ok(())
+    })?;
     Ok(*hasher.finalize().as_bytes())
 }
 
 /// Copy `src` to `dst` so that `dst` is never observable in a partial state:
 /// write a temp file in the destination directory, fsync it, verify its hash
 /// against the bytes actually read from the source, then rename.
-pub fn copy_atomic(src: &Path, dst: &Path, tmp: &Path) -> io::Result<Hash> {
+///
+/// The directory the file was renamed into is not flushed here: the caller
+/// collects the directories it wrote into and flushes each of them once, when
+/// the run ends.
+pub fn copy_atomic(src: &Path, dst: &Path, tmp: &Path, mode: Fsync) -> io::Result<Hash> {
     let parent = dst
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
@@ -104,7 +221,7 @@ pub fn copy_atomic(src: &Path, dst: &Path, tmp: &Path) -> io::Result<Hash> {
     // not even one that cannot be written to.
     let _ = fs::remove_file(tmp);
 
-    let outcome = copy_via_temp(src, tmp, dst, parent);
+    let outcome = copy_via_temp(src, tmp, dst, mode);
     if outcome.is_err() {
         let _ = fs::remove_file(tmp);
     }
@@ -117,7 +234,7 @@ pub fn copy_atomic(src: &Path, dst: &Path, tmp: &Path) -> io::Result<Hash> {
 /// The whole file is verified once it is complete, prefix included: a prefix
 /// that does not belong to this source fails the check and the temporary file
 /// is thrown away, so the next attempt starts from zero.
-pub fn copy_resumable(src: &Path, dst: &Path, tmp: &Path) -> io::Result<Hash> {
+pub fn copy_resumable(src: &Path, dst: &Path, tmp: &Path, mode: Fsync) -> io::Result<Hash> {
     let parent = dst
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
@@ -141,31 +258,27 @@ pub fn copy_resumable(src: &Path, dst: &Path, tmp: &Path) -> io::Result<Hash> {
     }
 
     if offset < size {
-        let mut reader = BufReader::with_capacity(
-            BUF,
-            File::open(src).ctx(|| format!("opening {}", src.display()))?,
-        );
+        let mut reader = File::open(src).ctx(|| format!("opening {}", src.display()))?;
         reader
             .seek(SeekFrom::Start(offset))
             .ctx(|| format!("seeking in {}", src.display()))?;
-        let mut writer = BufWriter::with_capacity(
-            BUF,
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(tmp)
-                .ctx(|| format!("opening {}", tmp.display()))?,
-        );
-        let mut buf = vec![0u8; BUF];
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
+        let mut writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(tmp)
+            .ctx(|| format!("opening {}", tmp.display()))?;
+        with_scratch(|buf| -> io::Result<()> {
+            loop {
+                let n = reader.read(buf)?;
+                if n == 0 {
+                    break;
+                }
+                writer.write_all(&buf[..n])?;
             }
-            writer.write_all(&buf[..n])?;
-        }
+            Ok(())
+        })?;
         writer.flush()?;
-        fsync_hard(writer.get_ref())?;
+        fsync_file(&writer, mode)?;
     }
 
     // Verify what landed on disk rather than trusting the write path.
@@ -181,32 +294,27 @@ pub fn copy_resumable(src: &Path, dst: &Path, tmp: &Path) -> io::Result<Hash> {
     apply_mtime(tmp, mtime_ns(&meta), "copying");
     fs::rename(tmp, dst)
         .ctx(|| format!("moving {} into place at {}", tmp.display(), dst.display()))?;
-    let _ = sync_dir(parent);
     Ok(expected)
 }
 
-fn copy_via_temp(src: &Path, tmp: &Path, dst: &Path, parent: &Path) -> io::Result<Hash> {
-    let mut reader = BufReader::with_capacity(
-        BUF,
-        File::open(src).ctx(|| format!("opening {}", src.display()))?,
-    );
-    let mut writer = BufWriter::with_capacity(
-        BUF,
-        File::create(tmp).ctx(|| format!("creating {}", tmp.display()))?,
-    );
+fn copy_via_temp(src: &Path, tmp: &Path, dst: &Path, mode: Fsync) -> io::Result<Hash> {
+    let mut reader = File::open(src).ctx(|| format!("opening {}", src.display()))?;
+    let mut writer = File::create(tmp).ctx(|| format!("creating {}", tmp.display()))?;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; BUF];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+    with_scratch(|buf| -> io::Result<()> {
+        loop {
+            let n = reader.read(buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            writer.write_all(&buf[..n])?;
         }
-        hasher.update(&buf[..n]);
-        writer.write_all(&buf[..n])?;
-    }
+        Ok(())
+    })?;
     let source_hash = *hasher.finalize().as_bytes();
     writer.flush()?;
-    fsync_hard(writer.get_ref())?;
+    fsync_file(&writer, mode)?;
     drop(writer);
 
     // Verify what landed on disk rather than trusting the write path.
@@ -220,7 +328,6 @@ fn copy_via_temp(src: &Path, tmp: &Path, dst: &Path, parent: &Path) -> io::Resul
     apply_mtime(tmp, mtime_ns(&meta), "copying");
     fs::rename(tmp, dst)
         .ctx(|| format!("moving {} into place at {}", tmp.display(), dst.display()))?;
-    let _ = sync_dir(parent);
     Ok(source_hash)
 }
 
@@ -243,6 +350,15 @@ pub fn fsync_hard(file: &File) -> io::Result<()> {
 
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
+}
+
+/// Make a file's bytes durable, as far as the mode asks for.
+pub fn fsync_file(file: &File, mode: Fsync) -> io::Result<()> {
+    match mode {
+        Fsync::Off => Ok(()),
+        Fsync::Data => file.sync_all(),
+        Fsync::Full => fsync_hard(file),
+    }
 }
 
 /// Remove `dir` and its ancestors up to (but never including) `root` while empty.
@@ -449,6 +565,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_barrier_modes_say_what_they_are() {
+        assert_eq!(Fsync::parse("full"), Some(Fsync::Full));
+        assert_eq!(Fsync::parse("DATA"), Some(Fsync::Data));
+        assert_eq!(Fsync::parse(" off "), Some(Fsync::Off));
+        assert_eq!(Fsync::parse("sometimes"), None);
+        for mode in [Fsync::Full, Fsync::Data, Fsync::Off] {
+            assert_eq!(Fsync::from_code(mode.code()), mode);
+            assert_eq!(Fsync::parse(mode.name()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn a_directory_is_flushed_once_however_many_files_went_into_it() {
+        let mut flush = DirFlush::default();
+        flush.note(Path::new("/tmp/one"));
+        flush.note(Path::new("/tmp/one"));
+        flush.note(Path::new("/tmp/two"));
+        assert_eq!(flush.dirs.len(), 2, "the same directory is one entry");
+        flush.flush(Fsync::Off);
+        assert!(
+            flush.dirs.is_empty(),
+            "the set is emptied whether the barrier ran or not"
+        );
+    }
+
+    #[test]
     fn timestamp_shape_is_stable() {
         let ts = timestamp_utc();
         assert_eq!(ts.len(), 15, "unexpected timestamp {ts}");
@@ -463,7 +605,7 @@ mod tests {
         fs::write(&src, b"hello twin").unwrap();
 
         let tmp = dst.parent().unwrap().join(temp_file_name(&dst));
-        let hash = copy_atomic(&src, &dst, &tmp).unwrap();
+        let hash = copy_atomic(&src, &dst, &tmp, Fsync::Full).unwrap();
         assert_eq!(fs::read(&dst).unwrap(), b"hello twin");
         assert_eq!(hash, *blake3::hash(b"hello twin").as_bytes());
         let src_m = fs::metadata(&src).unwrap();
@@ -543,7 +685,7 @@ mod tests {
 
         // An interrupted run left the first half behind.
         fs::write(&tmp, &payload[..1000]).unwrap();
-        let hash = copy_resumable(&src, &dst, &tmp).unwrap();
+        let hash = copy_resumable(&src, &dst, &tmp, Fsync::Full).unwrap();
         assert_eq!(hash, *blake3::hash(&payload).as_bytes());
         assert_eq!(fs::read(&dst).unwrap(), payload);
         assert!(!tmp.exists(), "the temp file must be gone");
@@ -552,7 +694,7 @@ mod tests {
         let dst2 = dir.path().join("out/dst2.bin");
         let tmp2 = dst2.parent().unwrap().join(temp_file_name(&dst2));
         fs::write(&tmp2, b"not the beginning of this file").unwrap();
-        let error = copy_resumable(&src, &dst2, &tmp2).unwrap_err();
+        let error = copy_resumable(&src, &dst2, &tmp2, Fsync::Full).unwrap_err();
         assert!(is_verification_error(&error), "{error}");
         assert!(!tmp2.exists(), "a bad prefix must be thrown away");
         assert!(!dst2.exists(), "nothing may be published");
